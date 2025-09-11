@@ -6,11 +6,21 @@
 #include "MAX30100_PulseOximeter.h"
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <DallasTemperature.h>
 
 #define VIBRATION_PIN 5
 #define ONE_WIRE_BUS 4  // DS18B20 Data pin
 #define REPORTING_PERIOD_MS 1000
 #define LED_PIN 2  // LED to blink on button press
+
+// OLED Display setup
+#define i2c_Address 0x3c
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 float BPM = 0, SpO2 = 0, temperatureC = 0.0;
 uint32_t tsLastReport = 0;
@@ -176,6 +186,35 @@ String SendHTML(float BPM, float SpO2, float temperatureC_raw) {
   return html;
 }
 
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+
+  // Title
+  display.setCursor(15, 0);
+  display.setTextSize(2);
+  display.print("VITALS");
+  display.setTextSize(1);
+  display.drawFastHLine(0, 18, SCREEN_WIDTH, SH110X_WHITE);
+
+  // Display BPM
+  display.setCursor(0, 25);
+  display.print("BPM: ");
+  display.print(sensorReady ? String((int)BPM) : "N/A");
+
+  // Display SpO2
+  display.setCursor(0, 38);
+  display.print("SpO2: ");
+  display.print(sensorReady ? String((int)SpO2) + "%" : "N/A");
+
+  // Display Temperature
+  display.setCursor(0, 51);
+  display.print("Temp: ");
+  display.print(String(temperatureC + 3.0, 1) + " C"); // Apply +3 adjustment
+
+  display.display();
+}
 
 void handle_OnConnect() {
   server.send(200, "text/html", SendHTML(BPM, SpO2, temperatureC));
@@ -195,6 +234,15 @@ void setup() {
 
   Wire.begin();
   sensors.begin();
+
+  // Initialize OLED
+  if (!display.begin(i2c_Address, true)) {
+    Serial.println(F("SH1106 allocation failed"));
+    for (;;); // Don't proceed, loop forever
+  }
+  display.clearDisplay();
+  display.println("Health Monitor");
+  display.display();
 
   // MAX30100 Init
   Serial.println("Initializing MAX30100...");
@@ -271,6 +319,9 @@ void loop() {
     bool tempOK = adjTemp >= 35 && adjTemp <= 38;
 
     alertActive = !(bpmOK && spo2OK && tempOK);  // Alert if any value is not okay
+
+    // Update the OLED display with new values
+    updateDisplay();
   }
 
   // Check button presses
