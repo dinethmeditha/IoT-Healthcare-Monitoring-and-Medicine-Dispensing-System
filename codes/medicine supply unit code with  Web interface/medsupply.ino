@@ -1,306 +1,559 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <time.h>
 #include <esp_now.h>
-#include <esp_wifi.h>
-#include <Wire.h>
-#include "MAX30100_PulseOximeter.h"
-#include <OneWire.h>
-#include <DallasTemperature.h>
 
-#define VIBRATION_PIN 5
-#define ONE_WIRE_BUS 4  // DS18B20 Data pin
-#define REPORTING_PERIOD_MS 1000
-#define LED_PIN 2  // LED to blink on button press
+#define STEP_PIN 19
+#define DIR_PIN 18
+const int ledPin = 21;
+const int msgLedPin = 13;
+const int stepsPerRevolution = 20;
+const int microsteps = 10;
+const long totalSteps = (stepsPerRevolution * microsteps) / 24; // (200 / 360) * 15 = 8.33, so ~8 steps for 15 degrees. 200/24 is ~8.33
+const long delayPerStep = 2500; // Microseconds
 
-float BPM = 0, SpO2 = 0, temperatureC = 0.0;
-uint32_t tsLastReport = 0;
-bool sensorReady = false;
-
-// LED blink control
-bool ledBlinking = false;
-unsigned long ledBlinkStart = 0;
-const unsigned long ledBlinkDuration = 2000;
-
-// Web server
 WebServer server(80);
-const char* ssid = "Health Monitor";
 
-// MAX30100 sensor
-PulseOximeter pox;
+const char* ssid = "Time Scheduler";
+const char* password = "12345678";
 
-// DS18B20 setup
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 19800; // GMT+5:30
+const int daylightOffset_sec = 0;
 
-// Button pins and messages
-const int buttonPins[8] = {13, 12, 14, 27, 26, 25, 33, 32};
-bool lastButtonState[8] = {HIGH};
-unsigned long lastDebounceTime[8] = {0};
-const unsigned long debounceDelay = 300;
-String lastMessage = "No message yet";
-const char* buttonMessages[8] = {
-  "Medicine A Dispensed",
-  "Medicine B Dispensed",
-  "Vitals Checked",
-  "Water Reminder",
-  "Doctor Alert Sent",
-  "Time to Rest",
-  "Nurse Assistance Needed",
-  "Emergency Alert Triggered"
-};
+uint8_t receiverMAC[] = {0xEC, 0xE3, 0x34, 0x7A, 0x81, 0xD5};
+uint8_t senderMAC[6];
 
-// ESP-NOW callback
-void onReceive(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
-  Serial.println("ESP-NOW Message Received.");
-  if (len == 1 && incomingData[0] == 1) {
-    digitalWrite(VIBRATION_PIN, HIGH);
-    delay(10000);
-    digitalWrite(VIBRATION_PIN, LOW);
-  }
-}
+bool scheduled[24] = {false};
+bool triggered[24] = {false};
+bool expired[24] = {false};
+time_t triggerTimes[24] = {0};
+bool runLoopNow = false;
+bool isRunning[24] = {false};
+bool manualRunning = false;
 
-void onBeatDetected() {
-  Serial.println("Beat Detected!");
-}
+bool msgLedBlink = false;
+unsigned long msgLedStart = 0;
+const unsigned long msgLedDuration = 2000;
 
-// HTML Page
-String SendHTML(float BPM, float SpO2, float temperatureC_raw) {
-  float temperatureC = temperatureC_raw + 3; // +3 adjustment
+unsigned long stopwatchStartTime = 0;
+bool stopwatchRunning = false;
+unsigned long elapsedTime = 0;
 
-  bool bpmOK = BPM >= 60 && BPM <= 120;
-  bool spo2OK = SpO2 >= 95;
-  bool tempOK = temperatureC >= 35 && temperatureC <= 38;
-
-  String outOfRange = "";
-
-  if (!bpmOK) outOfRange += "Heart Rate, ";
-  if (!spo2OK) outOfRange += "SpO₂, ";
-  if (!tempOK) outOfRange += "Temperature, ";
-
-  // Trim last comma if needed
-  if (outOfRange.endsWith(", ")) {
-    outOfRange = outOfRange.substring(0, outOfRange.length() - 2);
-  }
-
-  String html = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Health Monitor</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body {
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      background: #f2f2f2;
-      margin: 0;
-      padding: 0;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      height: 100vh;
-    }
-    .card {
-      background: #ffffff;
-      padding: 30px 40px;
-      border-radius: 16px;
-      box-shadow: 0 8px 16px rgba(0, 0, 0, 0.15);
-      text-align: center;
-      max-width: 400px;
-      width: 90%;
-    }
-    h1 {
-      color: #008080;
-      margin-bottom: 20px;
-    }
-    p {
-      font-size: 20px;
-      margin: 10px 0 5px;
-    }
-    meter {
-      width: 100%;
-      height: 20px;
-      margin-bottom: 15px;
-    }
-    .error {
-      color: red;
-      font-weight: bold;
-      margin-top: 10px;
-    }
-    .alert-box {
-      color: white;
-      background-color: #e74c3c;
-      padding: 10px;
-      border-radius: 8px;
-      margin-top: 15px;
-      font-weight: bold;
-    }
-    .footer {
-      margin-top: 20px;
-      font-size: 14px;
-      color: #888;
-    }
-  </style>
-  <script>
-    setInterval(() => {
-      location.reload();
-    }, 2000);
-  </script>
-</head>
-<body>
-  <div class="card">
-    <h1>Health Monitor</h1>
-)rawliteral";
-
-  if (sensorReady) {
-    html += "<p><b>Heart Rate:</b> " + String((int)BPM) + " BPM</p>";
-    html += "<meter min='40' max='180' low='60' high='120' optimum='75' value='" + String((int)BPM) + "'></meter>";
-
-    html += "<p><b>SpO₂:</b> " + String((int)SpO2) + " %</p>";
-    html += "<meter min='70' max='100' low='90' high='95' optimum='98' value='" + String((int)SpO2) + "'></meter>";
-  } else {
-    html += "<p class='error'>MAX30100 Not Detected</p>";
-  }
-
-  html += "<p><b>Temperature:</b> " + String(temperatureC, 1) + " °C</p>";
-  html += "<meter min='30' max='45' low='35' high='38' optimum='36.5' value='" + String(temperatureC, 1) + "'></meter>";
-
-  if (!bpmOK || !spo2OK || !tempOK) {
-    html += "<div class='alert-box'>⚠️ Alert: " + outOfRange + " out of safe range!</div>";
-  }
-
-  html += "<p><b>Last Message:</b> " + lastMessage + "</p>";
-  html += "<div class='footer'>Auto-refresh every 2 seconds</div>";
-  html += "</div></body></html>";
-
-  return html;
-}
-
-
-void handle_OnConnect() {
-  server.send(200, "text/html", SendHTML(BPM, SpO2, temperatureC));
-}
-
-void handle_NotFound() {
-  server.send(404, "text/plain", "Not found");
-}
+String lastReceivedMessage = ""; //  Store last received ESP-NOW message
 
 void setup() {
   Serial.begin(115200);
-  pinMode(VIBRATION_PIN, OUTPUT);
-  digitalWrite(VIBRATION_PIN, LOW);
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  pinMode(STEP_PIN, OUTPUT);
+  pinMode(DIR_PIN, OUTPUT);
+  pinMode(ledPin, OUTPUT);
+  pinMode(msgLedPin, OUTPUT);
+  digitalWrite(DIR_PIN, HIGH);
+  digitalWrite(msgLedPin, LOW);
 
-  Wire.begin();
-  sensors.begin();
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(ssid, password);
+  delay(100);
 
-  // MAX30100 Init
-  Serial.println("Initializing MAX30100...");
-  if (!pox.begin()) {
-    Serial.println("MAX30100 FAILED - Check wiring!");
-    sensorReady = false;
-  } else {
-    Serial.println("MAX30100 SUCCESS");
-    sensorReady = true;
-    pox.setOnBeatDetectedCallback(onBeatDetected);
-    pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
-  }
-
-  // Button pins
-  for (int i = 0; i < 8; i++) {
-    pinMode(buttonPins[i], INPUT_PULLUP);
-  }
-
-  // Wi-Fi Access Point
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(ssid);
+  Serial.println("Access Point started");
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
 
-  server.on("/", handle_OnConnect);
-  server.onNotFound(handle_NotFound);
-  server.begin();
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
-  // Show MAC
-  uint8_t mac[6];
-  esp_wifi_get_mac(WIFI_IF_AP, mac);
-  Serial.print("Receiver MAC: ");
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+
+  WiFi.macAddress(senderMAC);
+  Serial.print("Sender MAC Address: ");
   for (int i = 0; i < 6; i++) {
-    if (mac[i] < 16) Serial.print("0");
-    Serial.print(mac[i], HEX);
+    if (senderMAC[i] < 16) Serial.print("0");
+    Serial.print(senderMAC[i], HEX);
     if (i < 5) Serial.print(":");
   }
   Serial.println();
 
-  // ESP-NOW Setup
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW INIT FAILED");
-    while (true) delay(1000);
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add ESP-NOW peer");
   }
-  esp_now_register_recv_cb(onReceive);
+
+  esp_now_register_recv_cb(onDataRecv);
+  Serial.println("ESP-NOW receive callback registered.");
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/reset", HTTP_GET, handleReset);
+  server.on("/triggerLoop", HTTP_GET, handleManualTrigger);
+  server.on("/setSchedule", HTTP_GET, handleSetSchedule);
+  server.on("/getStopwatch", HTTP_GET, handleGetStopwatch);
+  server.on("/getLastMsg", HTTP_GET, handleGetLastMessage); //  API to serve last received message
+
+  server.begin();
+  Serial.println("Web server started");
 }
 
 void loop() {
   server.handleClient();
+  checkAndRunSchedule();
 
-  if (sensorReady) {
-    pox.update();
-    BPM = pox.getHeartRate();
-    SpO2 = pox.getSpO2();
+  if (runLoopNow) {
+    runLoopNow = false;
+    manualRunning = true;
+    runStepperLoop();
+    manualRunning = false;
   }
 
-  static bool alertActive = false;
-
-  if (millis() - tsLastReport > REPORTING_PERIOD_MS) {
-    sensors.requestTemperatures();
-    temperatureC = sensors.getTempCByIndex(0);
-
-    Serial.print("BPM: "); Serial.println(BPM);
-    Serial.print("SpO₂: "); Serial.println(SpO2);
-    Serial.print("Temp: "); Serial.println(temperatureC);
-    Serial.println("----------");
-
-    tsLastReport = millis();
-
-    // Check for alerts
-    float adjTemp = temperatureC + 3; // +3 adjustment
-    bool bpmOK = BPM >= 60 && BPM <= 120;
-    bool spo2OK = SpO2 >= 95;
-    bool tempOK = adjTemp >= 35 && adjTemp <= 38;
-
-    alertActive = !(bpmOK && spo2OK && tempOK);  // Alert if any value is not okay
-  }
-
-  // Check button presses
-  for (int i = 0; i < 8; i++) {
-    bool currentState = digitalRead(buttonPins[i]);
-    if (currentState == LOW && lastButtonState[i] == HIGH && (millis() - lastDebounceTime[i] > debounceDelay)) {
-      lastDebounceTime[i] = millis();
-      lastMessage = buttonMessages[i];
-      Serial.print("Button "); Serial.print(i + 1); Serial.print(": ");
-      Serial.println(lastMessage);
-
-      // Start LED blink
-      digitalWrite(LED_PIN, HIGH);
-      ledBlinking = true;
-      ledBlinkStart = millis();
+  if (stopwatchRunning) {
+    bool allCompleted = true;
+    for (int i = 0; i < 24; i++) {
+      if (scheduled[i] && !triggered[i]) {
+        allCompleted = false;
+        break;
+      }
     }
-    lastButtonState[i] = currentState;
+
+    if (allCompleted) {
+      stopwatchRunning = false;
+      elapsedTime = millis() - stopwatchStartTime;
+    }
   }
 
-  // Also trigger LED if alert is active (but don't restart timer if already blinking)
-  if (alertActive && !ledBlinking) {
-    digitalWrite(LED_PIN, HIGH);
-    ledBlinking = true;
-    ledBlinkStart = millis();
+  if (msgLedBlink && (millis() - msgLedStart >= msgLedDuration)) {
+    digitalWrite(msgLedPin, LOW);
+    msgLedBlink = false;
+  }
+}
+
+void checkAndRunSchedule() {
+  time_t now;
+  time(&now);
+
+  for (int i = 0; i < 24; i++) {
+    if (scheduled[i] && !triggered[i]) {
+      if (now >= triggerTimes[i]) {
+        isRunning[i] = true;
+        runStepperLoop();
+        triggered[i] = true;
+        isRunning[i] = false;
+      } else if (now > triggerTimes[i] + 60) {
+        expired[i] = true;
+        scheduled[i] = false;
+      }
+    }
+  }
+}
+
+void handleSetSchedule() {
+  if (server.hasArg("b")) {
+    String param = server.arg("b");
+    param.trim();
+
+    for (int i = 0; i < 24; i++) {
+      scheduled[i] = false;
+      triggered[i] = false;
+      expired[i] = false;
+      triggerTimes[i] = 0;
+    }
+
+    time_t now;
+    time(&now);
+
+    bool anyScheduled = false;
+    while (param.length() > 0) {
+      int sep = param.indexOf(',');
+      String pair = (sep == -1) ? param : param.substring(0, sep);
+      int dash = pair.indexOf('-');
+      if (dash > 0) {
+        int index = pair.substring(0, dash).toInt();
+        int delayMin = pair.substring(dash + 1).toInt();
+        if (index >= 0 && index < 24 && delayMin > 0) {
+          scheduled[index] = true;
+          triggerTimes[index] = now + (delayMin * 60);
+          anyScheduled = true;
+        }
+      }
+      if (sep == -1) break;
+      param = param.substring(sep + 1);
+    }
+
+    if (anyScheduled) {
+      stopwatchStartTime = millis();
+      elapsedTime = 0;
+      stopwatchRunning = true;
+      Serial.println("Stopwatch started");
+    }
   }
 
-  // Turn off LED after duration
-  if (ledBlinking && millis() - ledBlinkStart >= ledBlinkDuration) {
-    digitalWrite(LED_PIN, LOW);
-    ledBlinking = false;
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  Serial.print("Received message from: ");
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr),
+           "%02X:%02X:%02X:%02X:%02X:%02X",
+           info->src_addr[0], info->src_addr[1], info->src_addr[2],
+           info->src_addr[3], info->src_addr[4], info->src_addr[5]);
+  Serial.println(macStr);
+
+  Serial.print("Data: ");
+  lastReceivedMessage = ""; // Reset
+  for (int i = 0; i < len; i++) {
+    lastReceivedMessage += (char)data[i]; // Store message
+    Serial.print((char)data[i]);
+  }
+  Serial.println();
+
+  digitalWrite(msgLedPin, HIGH);
+  msgLedStart = millis();
+  msgLedBlink = true;
+}
+
+void handleGetStopwatch() {
+  unsigned long currentTime = stopwatchRunning ? (millis() - stopwatchStartTime) : elapsedTime;
+  server.send(200, "text/plain", String(currentTime));
+}
+
+void handleGetLastMessage() {
+  server.send(200, "text/plain", lastReceivedMessage); // Serve last message
+}
+
+void handleRoot() {
+  String html = R"rawliteral(
+    <html><head>
+    <title>Medicine Supply Scheduler</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+      body {
+        font-family: 'Segoe UI', Tahoma, sans-serif;
+        background: #f9f9f9;
+        margin: 0;
+        padding: 20px;
+        color: #333;
+      }
+      .header {
+        background-color: #4CAF50;
+        color: white;
+        padding: 20px;
+        border-radius: 12px;
+        text-align: center;
+        margin-bottom: 20px;
+      }
+      .header h1 {
+        margin: 0;
+        font-size: 26px;
+      }
+      .card {
+        background: white;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+        margin-bottom: 20px;
+      }
+      .stopwatch {
+        font-size: 1.4em;
+        text-align: center;
+        background: #e0f7fa;
+        padding: 10px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+      }
+      .manual, .set-btn, .done-btn {
+        width: 100%;
+        height: 45px;
+        margin-top: 10px;
+        font-weight: bold;
+        font-size: 16px;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      .manual { background-color: #ffc107; }
+      .set-btn { background-color: #8bc34a; color: white; }
+      .reset-btn { background-color: #e57373; color: white; }
+      label {
+        display: block;
+        margin: 10px 0 5px;
+        font-weight: bold;
+      }
+      input[type=number] {
+        width: 60px;
+        padding: 5px;
+        font-size: 16px;
+        margin-right: 5px;
+        border-radius: 4px;
+        border: 1px solid #ccc;
+      }
+      .time-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 8px;
+      }
+      .status {
+        font-size: 14px;
+        font-weight: bold;
+        padding-left: 10px;
+      }
+      .status.running { color: #2196F3; }
+      .status.done { color: green; }
+      .status.scheduled { color: orange; }
+      .status.expired { color: red; }
+
+      .input-columns {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 20px;
+      }
+      .left-column, .right-column {
+        flex: 1;
+        min-width: 300px;
+      }
+    </style>
+    </head><body>
+
+    <div class="header">
+      <h1>Medicine Supply Scheduler</h1>
+      <p>Enter Patient's Medicine Supply Timetable</p>
+    </div>
+
+    <div class="stopwatch" id="stopwatchDisplay">Stopwatch: 00:00:00.000</div>
+
+    <div class="card">
+  <h2>Last Message Received</h2>
+  <div id="msgDisplay" style="font-size: 18px; color: #333; background: #eef; padding: 10px; border-radius: 8px;">None</div>
+</div>
+
+
+    <div class="card">
+      <h2>Manual Trigger</h2>
+      <button class="manual" id="manualTriggerBtn" onclick="triggerLoop()">Run Stepper Motor and Vibrating Loop</button>
+    </div>
+
+    <div class="card">
+      <h2>Set Time (hours and minutes)</h2>
+      <form id="scheduleForm">
+      <div class='input-columns'>
+        <div class='left-column'>
+  )rawliteral";
+
+  time_t now;
+  time(&now);
+
+  for (int i = 0; i < 12; i++) {
+    html += "<div class='time-row'><div><label>Input " + String(i + 1) + ":</label>";
+
+    if (scheduled[i] && triggerTimes[i] > now) {
+      long remaining = triggerTimes[i] - now;
+      int hours = remaining / 3600;
+      int minutes = (remaining % 3600) / 60;
+      html += "<input type='number' id='hour" + String(i) + "' value='" + String(hours) + "' min='0' /> ";
+      html += "<input type='number' id='min" + String(i) + "' value='" + String(minutes) + "' min='0' />";
+    } else {
+      html += "<input type='number' id='hour" + String(i) + "' placeholder='hr' min='0' /> ";
+      html += "<input type='number' id='min" + String(i) + "' placeholder='min' min='0' />";
+    }
+
+    html += "</div><span class='status' id='status" + String(i) + "'></span></div>";
   }
 
+  html += "</div><div class='right-column'>";
+
+  for (int i = 12; i < 24; i++) {
+    html += "<div class='time-row'><div><label>Input " + String(i + 1) + ":</label>";
+
+    if (scheduled[i] && triggerTimes[i] > now) {
+      long remaining = triggerTimes[i] - now;
+      int hours = remaining / 3600;
+      int minutes = (remaining % 3600) / 60;
+      html += "<input type='number' id='hour" + String(i) + "' value='" + String(hours) + "' min='0' /> ";
+      html += "<input type='number' id='min" + String(i) + "' value='" + String(minutes) + "' min='0' />";
+    } else {
+      html += "<input type='number' id='hour" + String(i) + "' placeholder='hr' min='0' /> ";
+      html += "<input type='number' id='min" + String(i) + "' placeholder='min' min='0' />";
+    }
+
+    html += "</div><span class='status' id='status" + String(i) + "'></span></div>";
+  }
+
+  html += R"rawliteral(
+        </div>
+      </div>
+      </form>
+      <button class='set-btn' id="setBtn" onclick='setSchedule()'>Set Schedule</button>
+      <form action="/reset" method="get">
+        <button class='reset-btn' type="submit">Reset All</button>
+      </form>
+    </div>
+
+    <script>
+      function setSchedule() {
+        let params = [];
+        for (let i = 0; i < 24; i++) {
+          const h = document.getElementById('hour' + i).value;
+          const m = document.getElementById('min' + i).value;
+          if (h !== '' || m !== '') {
+            const totalMin = (parseInt(h || '0') * 60) + parseInt(m || '0');
+            if (totalMin > 0) {
+              params.push(i + '-' + totalMin);
+            }
+          }
+        }
+        if (params.length > 0) {
+          window.location.href = '/setSchedule?b=' + params.join(',');
+        }
+      }
+
+      function triggerLoop() {
+        const btn = document.getElementById('manualTriggerBtn');
+        btn.disabled = true;
+        btn.className = 'manual';
+        btn.innerText = "Running...";
+        fetch('/triggerLoop').then(() => {
+          setTimeout(() => {
+            btn.disabled = false;
+            btn.innerText = "Run Stepper Motor and Vibrating Loop";
+          }, 4000);
+        });
+      }
+
+      function formatTime(ms) {
+        let hours = Math.floor(ms / 3600000);
+        ms %= 3600000;
+        let minutes = Math.floor(ms / 60000);
+        ms %= 60000;
+        let seconds = Math.floor(ms / 1000);
+        ms %= 1000;
+
+        return (hours < 10 ? '0' : '') + hours + ':' +
+               (minutes < 10 ? '0' : '') + minutes + ':' +
+               (seconds < 10 ? '0' : '') + seconds + '.' +
+               (ms < 100 ? (ms < 10 ? '00' : '0') : '') + ms;
+      }
+
+      function updateStopwatch() {
+        fetch('/getStopwatch')
+          .then(response => response.text())
+          .then(time => {
+            document.getElementById('stopwatchDisplay').innerText = 'Stopwatch: ' + formatTime(parseInt(time));
+          });
+      }
+
+      function updateLastMessage() {
+  fetch('/getLastMsg')
+    .then(response => response.text())
+    .then(msg => {
+      document.getElementById('msgDisplay').innerText = msg || "None";
+    });
+}
+
+setInterval(updateLastMessage, 1000);
+updateLastMessage();
+
+
+      const scheduled = [)rawliteral";
+
+  for (int i = 0; i < 24; i++) {
+    if (i > 0) html += ",";
+    html += scheduled[i] ? "true" : "false";
+  }
+  html += "]\nconst triggered = [";
+  for (int i = 0; i < 24; i++) {
+    if (i > 0) html += ",";
+    html += triggered[i] ? "true" : "false";
+  }
+  html += "]\nconst expired = [";
+  for (int i = 0; i < 24; i++) {
+    if (i > 0) html += ",";
+    html += expired[i] ? "true" : "false";
+  }
+  html += "]\nconst running = [";
+  for (int i = 0; i < 24; i++) {
+    if (i > 0) html += ",";
+    html += isRunning[i] ? "true" : "false";
+  }
+  html += "]\n";
+
+  html += R"rawliteral(
+      function applyStatusColors() {
+        for (let i = 0; i < 24; i++) {
+          const el = document.getElementById('status' + i);
+          if (running[i]) {
+            el.innerText = 'Running';
+            el.className = 'status running';
+          } else if (triggered[i]) {
+            el.innerText = 'Done';
+            el.className = 'status done';
+          } else if (scheduled[i]) {
+            el.innerText = 'Scheduled';
+            el.className = 'status scheduled';
+          } else if (expired[i]) {
+            el.innerText = 'Expired';
+            el.className = 'status expired';
+          } else {
+            el.innerText = '';
+            el.className = 'status';
+          }
+        }
+      }
+
+      applyStatusColors();
+      setInterval(updateStopwatch, 100);
+      setInterval(() => location.reload(), 30000);
+    </script>
+    </body></html>
+  )rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void handleManualTrigger() {
+  runLoopNow = true;
+  server.send(200, "text/plain", "OK");
+}
+
+void handleReset() {
+  for (int i = 0; i < 24; i++) {
+    scheduled[i] = false;
+    triggered[i] = false;
+    expired[i] = false;
+    isRunning[i] = false;
+    triggerTimes[i] = 0;
+  }
+  stopwatchRunning = false;
+  elapsedTime = 0;
+  lastReceivedMessage = ""; //  Clear message too if needed
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+void runStepperLoop() {
+  uint8_t msg[] = {1};
+  esp_err_t result = esp_now_send(receiverMAC, msg, sizeof(msg));
+  if (result == ESP_OK) {
+    Serial.println("Vibration signal sent via ESP-NOW.");
+  } else {
+    Serial.println("Failed to send vibration signal.");
+  }
+
+  for (long i = 0; i < totalSteps; i++) {
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds(delayPerStep);
+    digitalWrite(STEP_PIN, LOW);
+    delayMicroseconds(delayPerStep);
+  }
+
+  digitalWrite(ledPin, HIGH);
+  delay(3000);
+  digitalWrite(ledPin, LOW);
 }
