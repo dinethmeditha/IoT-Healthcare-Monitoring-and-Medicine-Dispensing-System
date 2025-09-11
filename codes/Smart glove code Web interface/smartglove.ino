@@ -10,6 +10,8 @@
 #include <Adafruit_SH110X.h>
 #include <DallasTemperature.h>
 
+
+
 #define VIBRATION_PIN 5
 #define ONE_WIRE_BUS 4  // DS18B20 Data pin
 #define REPORTING_PERIOD_MS 1000
@@ -25,6 +27,39 @@ Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, 
 float BPM = 0, SpO2 = 0, temperatureC = 0.0;
 uint32_t tsLastReport = 0;
 bool sensorReady = false;
+
+// Add these global variables at the top of your code (after the existing globals)
+unsigned long lastAnimationUpdate = 0;
+const unsigned long animationInterval = 500; // 500ms animation cycle
+bool animationState = false;
+int scrollOffset = 0;
+unsigned long lastScrollUpdate = 0;
+const unsigned long scrollInterval = 150;
+
+// Smaller custom bitmap icons for 1.3" OLED (6x6 pixels each)
+const unsigned char heart_icon [] PROGMEM = {
+  0x66, 0xFF, 0xFF, 0x7E, 0x3C, 0x18
+};
+
+const unsigned char heart_beat_icon [] PROGMEM = {
+  0x7E, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C
+};
+
+const unsigned char pulse_icon [] PROGMEM = {
+  0x08, 0x3E, 0x08, 0x00, 0x00, 0x00
+};
+
+const unsigned char temp_icon [] PROGMEM = {
+  0x1C, 0x22, 0x37, 0x7F, 0x7F, 0x3E
+};
+
+const unsigned char lungs_icon [] PROGMEM = {
+  0x3C, 0x66, 0x66, 0x7E, 0x3C, 0x00
+};
+
+const unsigned char warning_icon [] PROGMEM = {
+  0x18, 0x3C, 0x7E, 0x18, 0x00, 0x18
+};
 
 // LED blink control
 bool ledBlinking = false;
@@ -75,7 +110,7 @@ void onBeatDetected() {
 
 // HTML Page
 String SendHTML(float BPM, float SpO2, float temperatureC_raw) {
-  float temperatureC = temperatureC_raw + 3; // +3 adjustment
+  float temperatureC = temperatureC_raw + 1; // +1 adjustment
 
   bool bpmOK = BPM >= 60 && BPM <= 120;
   bool spo2OK = SpO2 >= 95;
@@ -188,31 +223,157 @@ String SendHTML(float BPM, float SpO2, float temperatureC_raw) {
 
 void updateDisplay() {
   display.clearDisplay();
-  display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
-
-  // Title
-  display.setCursor(15, 0);
-  display.setTextSize(2);
-  display.print("VITALS");
+  
+  // Update animation state
+  if (millis() - lastAnimationUpdate >= animationInterval) {
+    animationState = !animationState;
+    lastAnimationUpdate = millis();
+  }
+  
+  // Compact header with smaller title
+  display.setCursor(0, 0);
   display.setTextSize(1);
-  display.drawFastHLine(0, 18, SCREEN_WIDTH, SH110X_WHITE);
-
-  // Display BPM
-  display.setCursor(0, 25);
-  display.print("BPM: ");
-  display.print(sensorReady ? String((int)BPM) : "N/A");
-
-  // Display SpO2
-  display.setCursor(0, 38);
-  display.print("SpO2: ");
-  display.print(sensorReady ? String((int)SpO2) + "%" : "N/A");
-
-  // Display Temperature
-  display.setCursor(0, 51);
-  display.print("Temp: ");
-  display.print(String(temperatureC + 3.0, 1) + " C"); // Apply +3 adjustment
-
+  display.print("HYGEIA");
+  
+  // Animate the heart icon 
+  if (animationState && sensorReady && BPM > 0) {
+    display.drawBitmap(40, 0, heart_beat_icon, 6, 6, SH110X_WHITE);
+  } else {
+    display.drawBitmap(40, 0, heart_icon, 6, 6, SH110X_WHITE);
+  }
+  
+  // WiFi status indicator
+  display.setCursor(120, 0);
+  if (WiFi.softAPgetStationNum() > 0) {
+    display.print("*"); // Connected
+  } else {
+    if (animationState) display.print("o"); // Blinking when disconnected
+  }
+  
+  // Separator line
+  display.drawFastHLine(0, 10, SCREEN_WIDTH, SH110X_WHITE);
+  
+  // Row 1: BPM (Left side)
+  bool bpmOK = (BPM >= 60 && BPM <= 120) || !sensorReady;
+  display.setCursor(0, 14);
+  
+  // Warning icon for BPM
+  if (!bpmOK && sensorReady && animationState) {
+    display.drawBitmap(0, 14, warning_icon, 6, 6, SH110X_WHITE);
+    display.setCursor(8, 14);
+  }
+  
+  display.drawBitmap((!bpmOK && sensorReady && animationState) ? 8 : 0, 14, pulse_icon, 6, 6, SH110X_WHITE);
+  display.setCursor((!bpmOK && sensorReady && animationState) ? 16 : 8, 14);
+  display.print("BPM");
+  
+  display.setCursor((!bpmOK && sensorReady && animationState) ? 16 : 8, 24);
+  if (sensorReady) {
+    display.setTextSize(1);
+    display.print(String((int)BPM));
+  } else {
+    display.print("---");
+  }
+  
+  // Row 1: SpO2 (Right side)
+  bool spo2OK = (SpO2 >= 95) || !sensorReady;
+  display.setCursor(70, 14);
+  
+  // Warning icon for SpO2
+  if (!spo2OK && sensorReady && animationState) {
+    display.drawBitmap(70, 14, warning_icon, 6, 6, SH110X_WHITE);
+    display.setCursor(78, 14);
+  }
+  
+  display.drawBitmap((!spo2OK && sensorReady && animationState) ? 78 : 70, 14, lungs_icon, 6, 6, SH110X_WHITE);
+  display.setCursor((!spo2OK && sensorReady && animationState) ? 86 : 78, 14);
+  display.print("SpO2");
+  
+  display.setCursor((!spo2OK && sensorReady && animationState) ? 86 : 78, 24);
+  if (sensorReady) {
+    display.setTextSize(1);
+    display.print(String((int)SpO2) + "%");
+  } else {
+    display.print("---%");
+  }
+  
+  // Separator line
+  display.drawFastHLine(0, 35, SCREEN_WIDTH, SH110X_WHITE);
+  
+  // Row 2: Temperature (Full width)
+  float adjTemp = temperatureC + 1; // +1 adjustment
+  bool tempOK = adjTemp >= 35 && adjTemp <= 38;
+  display.setCursor(0, 39);
+  
+  // Warning icon for Temperature
+  if (!tempOK && animationState) {
+    display.drawBitmap(0, 39, warning_icon, 6, 6, SH110X_WHITE);
+    display.setCursor(8, 39);
+  }
+  
+  display.drawBitmap(!tempOK && animationState ? 8 : 0, 39, temp_icon, 6, 6, SH110X_WHITE);
+  display.setCursor(!tempOK && animationState ? 16 : 8, 39);
+  display.print("TEMP: ");
+  display.setTextSize(2);
+  display.print(String(adjTemp, 1));
+  display.setTextSize(1);
+  display.print("C");
+  
+  // Status bar at bottom
+  display.setCursor(0, 55);
+  display.setTextSize(1);
+  
+  if ((!bpmOK && sensorReady) || (!spo2OK && sensorReady) || !tempOK) {
+    // Scrolling alert
+    if (millis() - lastScrollUpdate >= scrollInterval) {
+      scrollOffset++;
+      if (scrollOffset > 150) scrollOffset = -30;
+      lastScrollUpdate = millis();
+    }
+    
+    display.print("ALERT: Check vitals!");
+  } else {
+    display.print("Status: Normal");
+    
+    // Show last message if available
+    if (lastMessage != "No message yet") {
+      display.setCursor(0, 58);
+      display.setTextSize(1);
+      // Truncate message if too long
+      String shortMsg = lastMessage;
+      if (shortMsg.length() > 21) {
+        shortMsg = shortMsg.substring(0, 18) + "...";
+      }
+      display.print(shortMsg);
+    }
+  }
+  
+  // Enhanced but compact Serial Monitor output
+  static unsigned long lastSerialUpdate = 0;
+  if (millis() - lastSerialUpdate > 3000) { // Every 3 seconds
+    Serial.println("=== HYGEIA ===");
+    
+    Serial.print("BPM: ");
+    if (!bpmOK && sensorReady) Serial.print("[!] ");
+    Serial.print(sensorReady ? String((int)BPM) : "N/A");
+    
+    Serial.print(" | SpO2: ");
+    if (!spo2OK && sensorReady) Serial.print("[!] ");
+    Serial.print(sensorReady ? String((int)SpO2) + "%" : "N/A");
+    
+    Serial.print(" | Temp: ");
+    if (!tempOK) Serial.print("[!] ");
+    Serial.println(String(adjTemp, 1) + "°C");
+    
+    if ((!bpmOK && sensorReady) || (!spo2OK && sensorReady) || !tempOK) {
+      Serial.println("*** ALERT: Parameters out of range! ***");
+    }
+    
+    Serial.println("==============");
+    lastSerialUpdate = millis();
+  }
+  
   display.display();
 }
 
@@ -304,19 +465,14 @@ void loop() {
   if (millis() - tsLastReport > REPORTING_PERIOD_MS) {
     sensors.requestTemperatures();
     temperatureC = sensors.getTempCByIndex(0);
-
-    Serial.print("BPM: "); Serial.println(BPM);
-    Serial.print("SpO₂: "); Serial.println(SpO2);
-    Serial.print("Temp: "); Serial.println(temperatureC);
-    Serial.println("----------");
-
-    tsLastReport = millis();
-
+    
     // Check for alerts
-    float adjTemp = temperatureC + 3; // +3 adjustment
+    float adjTemp = temperatureC + 1; // +1 adjustment
     bool bpmOK = BPM >= 60 && BPM <= 120;
     bool spo2OK = SpO2 >= 95;
     bool tempOK = adjTemp >= 35 && adjTemp <= 38;
+
+    tsLastReport = millis();
 
     alertActive = !(bpmOK && spo2OK && tempOK);  // Alert if any value is not okay
 
