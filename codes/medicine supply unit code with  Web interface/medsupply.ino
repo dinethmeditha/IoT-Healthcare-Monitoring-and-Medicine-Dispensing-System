@@ -8,11 +8,11 @@
 #define STEP_PIN 19
 #define DIR_PIN 18
 const int ledPin = 21;
-const int msgLedPin = 13;
+const int msgLedPin = 13; // Microseconds
 const int stepsPerRevolution = 20;
-const int microsteps = 10;
+const int microsteps = 10; // Assuming 1/10 microstepping
 const long totalSteps = (stepsPerRevolution * microsteps) / 24; // (200 / 360) * 15 = 8.33, so ~8 steps for 15 degrees. 200/24 is ~8.33
-const long delayPerStep = 2500; // Microseconds
+const long delayPerStep = 2500;
 
 WebServer server(80);
 
