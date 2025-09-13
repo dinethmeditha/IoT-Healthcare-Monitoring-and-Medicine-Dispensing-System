@@ -30,8 +30,8 @@ const byte RATE_SIZE = 4; //Increase this for more averaging. 4 is good.
 byte rates[RATE_SIZE]; //Array of heart rates
 byte rateSpot = 0;
 long lastBeat = 0; //Time at which the last beat occurred
-int32_t beatsPerMinute; // Changed from float to int32_t to match function
-int8_t beatAvg;         // This will be the validity flag for heart rate
+int32_t beatsPerMinute; // Raw BPM from the algorithm
+int8_t beatAvg;         // Validity flag for heart rate
 
 #define MAX_SPO2_SAMPLES 100
 uint32_t irBuffer[MAX_SPO2_SAMPLES]; //infrared LED sensor data
@@ -460,6 +460,13 @@ void loop() {
       irBuffer[i] = particleSensor.getFIFOIR();
       particleSensor.nextSample(); //We're finished with this sample so move to next sample
     }
+    
+    // Check if a finger is present. If the IR reading is very low, it means no finger is detected.
+    if (particleSensor.getIR() < 50000) {
+      BPM = 0;
+      SpO2 = 0;
+      // Skip the rest of the sensor logic for this loop iteration
+    } else {
 
     // Calculate heart rate and SpO2 after collecting the samples
     maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &beatsPerMinute, &beatAvg);
@@ -470,7 +477,18 @@ void loop() {
     }
 
     if (beatAvg > 0) { // The algorithm returns a non-zero value for a valid HR
-      BPM = beatsPerMinute;
+      // Add the new valid reading to our circular buffer
+      rates[rateSpot++] = (byte)beatsPerMinute;
+      rateSpot %= RATE_SIZE; // Wrap around the buffer
+
+      // Calculate the average of the readings in the buffer
+      int total = 0;
+      for (int i = 0; i < RATE_SIZE; i++) {
+        total += rates[i];
+      }
+      // Update the global BPM with the smoothed average
+      BPM = total / RATE_SIZE;
+    }
     }
   }
 
@@ -495,7 +513,7 @@ void loop() {
 
     // Enhanced but compact Serial Monitor output
     static unsigned long lastSerialUpdate = 0;
-    if (millis() - lastSerialUpdate > 3000) { // Every 3 seconds
+    if (millis() - lastSerialUpdate > 1000) { // Every 3 seconds
       Serial.println("=== HYGEIA ===");
       
       Serial.print("BPM: ");
