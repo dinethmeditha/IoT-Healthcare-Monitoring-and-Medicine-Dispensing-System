@@ -3,13 +3,13 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <Wire.h>
-#include "MAX30100_PulseOximeter.h"
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "spo2_algorithm.h"
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
-#include <DallasTemperature.h>
-
 
 
 #define VIBRATION_PIN 5
@@ -22,7 +22,23 @@
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
-Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// MAX30102 Algorithm variables
+MAX30105 particleSensor;
+const byte RATE_SIZE = 4; //Increase this for more averaging. 4 is good.
+byte rates[RATE_SIZE]; //Array of heart rates
+byte rateSpot = 0;
+long lastBeat = 0; //Time at which the last beat occurred
+int32_t beatsPerMinute; // Changed from float to int32_t to match function
+int8_t beatAvg;         // This will be the validity flag for heart rate
+
+#define MAX_SPO2_SAMPLES 100
+uint32_t irBuffer[MAX_SPO2_SAMPLES]; //infrared LED sensor data
+uint32_t redBuffer[MAX_SPO2_SAMPLES];  //red LED sensor data
+int32_t bufferLength; //data length
+int32_t spo2; //SPO2 value
+int8_t validSPO2; //indicator to show if the SPO2 calculation is valid
 
 float BPM = 0, SpO2 = 0, temperatureC = 0.0;
 uint32_t tsLastReport = 0;
@@ -70,9 +86,6 @@ const unsigned long ledBlinkDuration = 2000;
 WebServer server(80);
 const char* ssid = "Health Monitor";
 
-// MAX30100 sensor
-PulseOximeter pox;
-
 // DS18B20 setup
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
@@ -102,10 +115,6 @@ void onReceive(const esp_now_recv_info_t *info, const uint8_t *incomingData, int
     delay(10000);
     digitalWrite(VIBRATION_PIN, LOW);
   }
-}
-
-void onBeatDetected() {
-  Serial.println("Beat Detected!");
 }
 
 // HTML Page
@@ -349,31 +358,6 @@ void updateDisplay() {
     }
   }
   
-  // Enhanced but compact Serial Monitor output
-  static unsigned long lastSerialUpdate = 0;
-  if (millis() - lastSerialUpdate > 3000) { // Every 3 seconds
-    Serial.println("=== HYGEIA ===");
-    
-    Serial.print("BPM: ");
-    if (!bpmOK && sensorReady) Serial.print("[!] ");
-    Serial.print(sensorReady ? String((int)BPM) : "N/A");
-    
-    Serial.print(" | SpO2: ");
-    if (!spo2OK && sensorReady) Serial.print("[!] ");
-    Serial.print(sensorReady ? String((int)SpO2) + "%" : "N/A");
-    
-    Serial.print(" | Temp: ");
-    if (!tempOK) Serial.print("[!] ");
-    Serial.println(String(adjTemp, 1) + "°C");
-    
-    if ((!bpmOK && sensorReady) || (!spo2OK && sensorReady) || !tempOK) {
-      Serial.println("*** ALERT: Parameters out of range! ***");
-    }
-    
-    Serial.println("==============");
-    lastSerialUpdate = millis();
-  }
-  
   display.display();
 }
 
@@ -397,7 +381,7 @@ void setup() {
   sensors.begin();
 
   // Initialize OLED
-  if (!display.begin(i2c_Address, true)) {
+  if (!display.begin(i2c_Address, true)) { // Pass I2C address here
     Serial.println(F("SH1106 allocation failed"));
     for (;;); // Don't proceed, loop forever
   }
@@ -406,16 +390,25 @@ void setup() {
   display.display();
 
   // MAX30100 Init
-  Serial.println("Initializing MAX30100...");
-  if (!pox.begin()) {
-    Serial.println("MAX30100 FAILED - Check wiring!");
+  Serial.println("Initializing MAX30102...");
+  // Initialize sensor
+  if (particleSensor.begin(Wire, I2C_SPEED_FAST) == false)
+  {
+    Serial.println("MAX30102 was not found. Please check wiring/power.");
     sensorReady = false;
   } else {
-    Serial.println("MAX30100 SUCCESS");
+    Serial.println("MAX30102 SUCCESS");
     sensorReady = true;
-    pox.setOnBeatDetectedCallback(onBeatDetected);
-    pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
+    // Recommended settings for MAX30102
+    byte ledBrightness = 60; //Options: 0=Off to 255=50mA
+    byte sampleAverage = 4; //Options: 1, 2, 4, 8, 16, 32
+    byte ledMode = 2; //Options: 1 = Red only, 2 = Red + IR, 3 = Red + IR + Green
+    int sampleRate = 100; //Options: 50, 100, 200, 400, 800, 1000, 1600, 3200
+    int pulseWidth = 411; //Options: 69, 118, 215, 411
+    int adcRange = 4096; //Options: 2048, 4096, 8192, 16384
+    particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
   }
+
 
   // Button pins
   for (int i = 0; i < 8; i++) {
@@ -454,10 +447,31 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  if (sensorReady) {
-    pox.update();
-    BPM = pox.getHeartRate();
-    SpO2 = pox.getSpO2();
+  if (sensorReady) {    
+    bufferLength = MAX_SPO2_SAMPLES; //reset the buffer length to start collecting new data
+
+    //read the first 100 samples, and determine the signal range
+    for (byte i = 0 ; i < bufferLength ; i++)
+    {
+      while (particleSensor.available() == false) //do we have new data?
+        particleSensor.check(); //Check the sensor for new data
+
+      redBuffer[i] = particleSensor.getFIFORed();
+      irBuffer[i] = particleSensor.getFIFOIR();
+      particleSensor.nextSample(); //We're finished with this sample so move to next sample
+    }
+
+    // Calculate heart rate and SpO2 after collecting the samples
+    maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &beatsPerMinute, &beatAvg);
+
+    // Only update our global variables if the algorithm returns valid data
+    if (validSPO2 > 0) {
+      SpO2 = spo2;
+    }
+
+    if (beatAvg > 0) { // The algorithm returns a non-zero value for a valid HR
+      BPM = beatsPerMinute;
+    }
   }
 
   static bool alertActive = false;
@@ -478,6 +492,30 @@ void loop() {
 
     // Update the OLED display with new values
     updateDisplay();
+
+    // Enhanced but compact Serial Monitor output
+    static unsigned long lastSerialUpdate = 0;
+    if (millis() - lastSerialUpdate > 3000) { // Every 3 seconds
+      Serial.println("=== HYGEIA ===");
+      
+      Serial.print("BPM: ");
+      if (!bpmOK && sensorReady) Serial.print("[!] ");
+      Serial.print(sensorReady ? String((int)BPM) : "N/A");
+      
+      Serial.print(" | SpO2: ");
+      if (!spo2OK && sensorReady) Serial.print("[!] ");
+      Serial.print(sensorReady ? String((int)SpO2) + "%" : "N/A");
+      
+      Serial.print(" | Temp: ");
+      if (!tempOK) Serial.print("[!] ");
+      Serial.println(String(adjTemp, 1) + "°C");
+      
+      if (alertActive) {
+        Serial.println("*** ALERT: Parameters out of range! ***");
+      }
+      Serial.println("==============");
+      lastSerialUpdate = millis();
+    }
   }
 
   // Check button presses
