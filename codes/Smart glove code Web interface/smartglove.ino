@@ -25,14 +25,14 @@ Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // MAX30102 Algorithm variables
 MAX30105 particleSensor;
-const byte RATE_SIZE = 4;
+const byte RATE_SIZE = 8;  // Increased for better averaging
 byte rates[RATE_SIZE];
 byte rateSpot = 0;
 long lastBeat = 0;
 int32_t beatsPerMinute;
 int8_t beatAvg;
 
-// FIXED: Proper SpO2 buffer management
+// SpO2 buffer management
 #define MAX_SPO2_SAMPLES 100
 uint32_t irBuffer[MAX_SPO2_SAMPLES];
 uint32_t redBuffer[MAX_SPO2_SAMPLES];
@@ -40,40 +40,40 @@ int32_t bufferLength;
 int32_t spo2;
 int8_t validSPO2;
 
+// BPM-specific buffer for heart rate (separate for better detection)
+#define MAX_HR_SAMPLES 100
+uint32_t irHRBuffer[MAX_HR_SAMPLES];
+uint16_t hrBufferIndex = 0;
+
 float BPM = 0, SpO2 = 0, temperatureC = 0.0;
 uint32_t tsLastReport = 0;
 bool sensorReady = false;
+bool alertActive = false;
 
-// FIXED: Better sample management
-static uint16_t bufferIndex = 0;  // Changed to uint16_t and better naming
-static bool bufferFilled = false;
-static unsigned long lastSensorRead = 0;
-static unsigned long lastTempRead = 0;
-static unsigned long lastDisplayUpdate = 0;
+// Sensor value offsets
+const float tempOffset = 1.0;
+const int bpmOffset = 20;
+const int spo2Offset = 10;
 
-// Bitmap icons (keeping your existing ones)
+// Sample management
+uint16_t spo2BufferIndex = 0;
+bool spo2BufferFilled = false;
+bool fingerDetected = false;
+bool beatsDetected = false;  // New: Track if any beats found
+unsigned long fingerPlaceTime = 0;  // For timeout
+
+// Bitmap icons (unchanged)
 const unsigned char heart_icon [] PROGMEM = {
   0x66, 0xFF, 0xFF, 0x7E, 0x3C, 0x18
 };
-
-const unsigned char heart_beat_icon [] PROGMEM = {
-  0x7E, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C
-};
-
 const unsigned char pulse_icon [] PROGMEM = {
   0x08, 0x3E, 0x08, 0x00, 0x00, 0x00
 };
-
 const unsigned char temp_icon [] PROGMEM = {
   0x1C, 0x22, 0x37, 0x7F, 0x7F, 0x3E
 };
-
 const unsigned char lungs_icon [] PROGMEM = {
   0x3C, 0x66, 0x66, 0x7E, 0x3C, 0x00
-};
-
-const unsigned char warning_icon [] PROGMEM = {
-  0x18, 0x3C, 0x7E, 0x18, 0x00, 0x18
 };
 
 // LED blink control
@@ -89,24 +89,18 @@ const char* ssid = "Health Monitor";
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
-// Button pins and messages
+// Button pins and messages (unchanged)
 const int buttonPins[8] = {13, 12, 14, 27, 26, 25, 33, 32};
-bool lastButtonState[8] = {HIGH};
+bool lastButtonState[8] = {HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH};
 unsigned long lastDebounceTime[8] = {0};
 const unsigned long debounceDelay = 300;
 String lastMessage = "No message yet";
 const char* buttonMessages[8] = {
-  "Medicine A Dispensed",
-  "Medicine B Dispensed",
-  "Vitals Checked",
-  "Water Reminder",
-  "Doctor Alert Sent",
-  "Time to Rest",
-  "Nurse Assistance Needed",
-  "Emergency Alert Triggered"
+  "Medicine A Dispensed", "Medicine B Dispensed", "Vitals Checked", "Water Reminder",
+  "Doctor Alert Sent", "Time to Rest", "Nurse Assistance Needed", "Emergency Alert Triggered"
 };
 
-// ESP-NOW callback
+// ESP-NOW callback (unchanged)
 void onReceive(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
   Serial.println("ESP-NOW Message Received.");
   if (len == 1 && incomingData[0] == 1) {
@@ -116,63 +110,41 @@ void onReceive(const esp_now_recv_info_t *info, const uint8_t *incomingData, int
   }
 }
 
-// HTML Page (keeping your existing function)
-String SendHTML(float BPM, float SpO2, float temperatureC_raw, String lastMessage) {
-  float temperatureC = temperatureC_raw + 1;
-
-  bool bpmOK = BPM >= 60 && BPM <= 120;
+// HTML Page (updated with beats status)
+String SendHTML(float BPM, float SpO2, float temperatureC_raw, String lastMessage, bool fingerDetected, bool beatsDetected) {
+  float temperatureC = temperatureC_raw + tempOffset;
+  bool bpmOK = (BPM + bpmOffset) >= 60 && (BPM + bpmOffset) <= 120;
   bool spo2OK = SpO2 >= 95;
   bool tempOK = temperatureC >= 35 && temperatureC <= 38;
 
   String outOfRange = "";
-
-  if (!bpmOK && BPM > 0) outOfRange += "Heart Rate, ";  // Only show alert if we have a reading
-  if (!spo2OK && SpO2 > 0) outOfRange += "SpO₂, ";     // Only show alert if we have a reading
+  if (!bpmOK && BPM > 0) outOfRange += "Heart Rate, ";
+  if (!spo2OK && SpO2 > 0) outOfRange += "SpO₂, ";
   if (!tempOK) outOfRange += "Temperature, ";
-
-  if (outOfRange.endsWith(", ")) {
-    outOfRange = outOfRange.substring(0, outOfRange.length() - 2);
-  }
+  if (outOfRange.endsWith(", ")) outOfRange = outOfRange.substring(0, outOfRange.length() - 2);
 
   String html = R"rawliteral(
 <!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>Health Monitor</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="refresh" content="3">
-  <style>
-    body{font-family:Arial;background:#f0f0f0;margin:0;padding:20px;}
-    .card{background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);max-width:400px;margin:0 auto;}
-    h1{color:#008080;margin-bottom:15px;text-align:center;}
-    p{font-size:18px;margin:8px 0;}
-    .alert{color:white;background:#e74c3c;padding:8px;border-radius:4px;margin-top:10px;font-weight:bold;}
-    .status{color:#27ae60;font-weight:bold;}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Health Monitor</h1>
-)rawliteral";
+<html><head><meta charset="UTF-8"><title>Health Monitor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="refresh" content="3">
+<style>body{font-family:Arial;background:#f0f0f0;margin:0;padding:20px;}.card{background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);max-width:400px;margin:0 auto;}
+h1{color:#008080;margin-bottom:15px;text-align:center;}p{font-size:18px;margin:8px 0;}.alert{color:white;background:#e74c3c;padding:8px;border-radius:4px;margin-top:10px;font-weight:bold;}
+.status{color:#27ae60;font-weight:bold;}meter{width:100%;height:20px;margin-bottom:15px;}</style></head><body>
+<div class="card"><h1>Health Monitor</h1>)rawliteral";
 
   if (sensorReady) {
-    if (BPM > 0) {
-      html += "<p><b>Heart Rate:</b> " + String((int)BPM) + " BPM</p>";
-    } else {
-      html += "<p><b>Heart Rate:</b> <span style='color:orange;'>Reading...</span></p>";
-    }
+    String bpmStatus = fingerDetected ? (beatsDetected ? String((int)(BPM + bpmOffset)) : "No Beats") : "No Finger";
+    html += "<p><b>Heart Rate:</b> " + bpmStatus + " BPM</p>";
+    if (beatsDetected && BPM > 0) html += "<meter min='40' max='180' low='60' high='120' optimum='75' value='" + String((int)(BPM + bpmOffset)) + "'></meter>";
     
-    if (SpO2 > 0) {
-      html += "<p><b>SpO₂:</b> " + String((int)SpO2) + " %</p>";
-    } else {
-      html += "<p><b>SpO₂:</b> <span style='color:orange;'>Reading...</span></p>";
-    }
+    String spo2Status = fingerDetected ? String((int)SpO2) : "No Finger";
+    html += "<p><b>SpO₂:</b> " + spo2Status + " %</p>";
+    if (SpO2 > 0) html += "<meter min='70' max='100' low='90' high='95' optimum='98' value='" + String((int)SpO2) + "'></meter>";
   } else {
     html += "<p style='color:red;'>MAX30102 Not Detected</p>";
   }
 
-  html += "<p><b>Temperature:</b> " + String(temperatureC, 1) + " °C</p>";
+  html += "<p><b>Temperature:</b> " + String(temperatureC, 1) + " °C</p><meter min='30' max='45' low='35' high='38' optimum='36.5' value='" + String(temperatureC, 1) + "'></meter>";
 
   if (outOfRange.length() > 0) {
     html += "<div class='alert'>⚠️ Alert: " + outOfRange + " out of range!</div>";
@@ -180,10 +152,7 @@ String SendHTML(float BPM, float SpO2, float temperatureC_raw, String lastMessag
     html += "<p class='status'>✓ All readings normal</p>";
   }
 
-  html += "<p><b>Last Message:</b> " + lastMessage + "</p>";
-  html += "<p><small>Auto-refresh every 3 seconds</small></p>";
-  html += "</div></body></html>";
-
+  html += "<p><b>Last Message:</b> " + lastMessage + "</p><p><small>Auto-refresh every 3 seconds</small></p></div></body></html>";
   return html;
 }
 
@@ -191,48 +160,41 @@ void updateDisplay() {
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
   
-  display.setCursor(0, 0);
-  display.setTextSize(1);
-  display.print("HYGEIA");
-  
+  display.setCursor(0, 0); display.setTextSize(1); display.print("HYGEIA");
   display.drawBitmap(42, 0, heart_icon, 6, 6, SH110X_WHITE);
-  
   display.setCursor(120, 0);
-  if (WiFi.softAPgetStationNum() > 0) {
-    display.print("*");
-  } else {
-    display.print("o");
-  }
+  display.print(WiFi.softAPgetStationNum() > 0 ? "*" : "o");
   
   display.drawFastHLine(0, 9, SCREEN_WIDTH, SH110X_WHITE);
   
-  bool bpmOK = (BPM >= 60 && BPM <= 120) || BPM == 0;  // Don't show error if no reading yet
-  bool spo2OK = (SpO2 >= 95) || SpO2 == 0;             // Don't show error if no reading yet
-  float adjTemp = temperatureC;
+  bool bpmOK = ((BPM + bpmOffset) >= 60 && (BPM + bpmOffset) <= 120) || BPM == 0;
+  bool spo2OK = (SpO2 >= 95) || SpO2 == 0;
+  float adjTemp = temperatureC + tempOffset;
   bool tempOK = adjTemp >= 35 && adjTemp <= 38;
   
-  display.setCursor(0, 12);
-  display.drawBitmap(0, 12, pulse_icon, 6, 6, SH110X_WHITE);
+  // Vitals row
+  display.setCursor(0, 12); display.drawBitmap(0, 12, pulse_icon, 6, 6, SH110X_WHITE);
   display.setCursor(8, 12);
   if (sensorReady && BPM > 0) {
-    display.print(String((int)BPM));
+    display.print(String((int)(BPM + bpmOffset)));
+  } else if (fingerDetected && beatsDetected) {
+    display.print("..");
+  } else if (fingerDetected) {
+    display.print("NO BEAT");
   } else {
     display.print("--");
   }
   
-  display.setCursor(45, 12);
-  display.drawBitmap(45, 12, lungs_icon, 6, 6, SH110X_WHITE);
+  display.setCursor(45, 12); display.drawBitmap(45, 12, lungs_icon, 6, 6, SH110X_WHITE);
   display.setCursor(53, 12);
   if (sensorReady && SpO2 > 0) {
     display.print(String((int)SpO2) + "%");
   } else {
-    display.print("--%");
+    display.print(fingerDetected ? "..%" : "--%");
   }
   
-  display.setCursor(85, 12);
-  display.drawBitmap(85, 12, temp_icon, 6, 6, SH110X_WHITE);
-  display.setCursor(93, 12);
-  display.print(String(adjTemp, 1) + "C");
+  display.setCursor(85, 12); display.drawBitmap(85, 12, temp_icon, 6, 6, SH110X_WHITE);
+  display.setCursor(93, 12); display.print(String(adjTemp, 1) + "C");
   
   display.drawFastHLine(0, 22, SCREEN_WIDTH, SH110X_WHITE);
   
@@ -241,47 +203,29 @@ void updateDisplay() {
     display.print("ALERT: CHECK VITALS");
   } else if (sensorReady && BPM > 0 && SpO2 > 0) {
     display.print("STATUS: NORMAL");
+  } else if (fingerDetected && !beatsDetected && (millis() - fingerPlaceTime > 10000)) {
+    display.print("NO BEATS DETECTED");
+  } else if (fingerDetected) {
+    display.print("CALCULATING...");
   } else {
-    display.print("READING SENSORS...");
+    display.print("PLACE FINGER");
   }
   
   display.drawFastHLine(0, 35, SCREEN_WIDTH, SH110X_WHITE);
   
-  display.setCursor(0, 38);
-  display.setTextSize(1);
-  display.print("MSG:");
-  display.setCursor(0, 48);
-  if (lastMessage != "No message yet" && lastMessage.length() > 0) {
-    String shortMsg = lastMessage;
-    if (shortMsg.length() > 21) {
-      shortMsg = shortMsg.substring(0, 18) + "...";
-    }
-    display.print(shortMsg);
-  } else {
-    display.print("No recent messages");
-  }
+  display.setCursor(0, 38); display.print("MSG:"); display.setCursor(0, 48);
+  String shortMsg = lastMessage.length() > 21 ? lastMessage.substring(0, 18) + "..." : lastMessage;
+  display.print(lastMessage == "No message yet" ? "No recent messages" : shortMsg);
   
   display.display();
 }
 
 void showSplashScreen() {
-  display.clearDisplay();
-  display.setTextColor(SH110X_WHITE);
-  
-  display.setCursor(20, 10);
-  display.setTextSize(2);
-  display.print("HYGEIA");
-  
-  display.setCursor(10, 30);
-  display.setTextSize(1);
-  display.print("Health Monitor");
-  
-  display.setCursor(25, 45);
-  display.setTextSize(1);
-  display.print("Starting...");
-  
-  display.display();
-  delay(2000);
+  display.clearDisplay(); display.setTextColor(SH110X_WHITE);
+  display.setCursor(20, 10); display.setTextSize(2); display.print("HYGEIA");
+  display.setCursor(10, 30); display.setTextSize(1); display.print("Health Monitor");
+  display.setCursor(25, 45); display.print("Starting...");
+  display.display(); delay(2000);
 }
 
 void checkButtons() {
@@ -290,98 +234,107 @@ void checkButtons() {
     if (currentState == LOW && lastButtonState[i] == HIGH && (millis() - lastDebounceTime[i] > debounceDelay)) {
       lastDebounceTime[i] = millis();
       lastMessage = buttonMessages[i];
-      Serial.print("Button "); Serial.print(i + 1); Serial.print(": ");
-      Serial.println(lastMessage);
-
-      // Start LED blink
-      digitalWrite(LED_PIN, HIGH);
-      ledBlinking = true;
-      ledBlinkStart = millis();
+      Serial.print("Button "); Serial.print(i + 1); Serial.print(": "); Serial.println(lastMessage);
+      digitalWrite(LED_PIN, HIGH); ledBlinking = true; ledBlinkStart = millis();
     }
     lastButtonState[i] = currentState;
   }
 }
 
 void handle_OnConnect() {
-  server.send(200, "text/html", SendHTML(BPM, SpO2, temperatureC, lastMessage));
+  server.send(200, "text/html", SendHTML(BPM, SpO2, temperatureC, lastMessage, fingerDetected, beatsDetected));
 }
 
 void handle_NotFound() {
   server.send(404, "text/plain", "Not found");
 }
 
-// FIXED: Proper sensor reading function
+// Enhanced sensor reading: Separate BPM and SpO2 paths
 void readSensorData() {
   if (!sensorReady) return;
-  
-  // Check if data is available
+
+  particleSensor.check();  // Poll for new data
+
   if (!particleSensor.available()) return;
-  
-  // Read new sample
-  uint32_t irValue = particleSensor.getIR();
-  uint32_t redValue = particleSensor.getRed();
+
+  uint32_t irValue = particleSensor.getFIFOIR();
+  uint32_t redValue = particleSensor.getFIFORed();
   particleSensor.nextSample();
-  
-  // Store in buffer
-  irBuffer[bufferIndex] = irValue;
-  redBuffer[bufferIndex] = redValue;
-  bufferIndex++;
-  
-  // Check if buffer is full
-  if (bufferIndex >= MAX_SPO2_SAMPLES) {
-    bufferIndex = 0;
-    bufferFilled = true;
+
+  Serial.print("IR: "); Serial.print(irValue); Serial.print(" | Red: "); Serial.println(redValue);
+
+  // Finger detection
+  fingerDetected = (irValue > 50000);
+  if (fingerDetected && fingerPlaceTime == 0) fingerPlaceTime = millis();
+
+  if (!fingerDetected) {
+    BPM = 0; SpO2 = 0; beatsDetected = false;
+    spo2BufferIndex = 0; spo2BufferFilled = false; hrBufferIndex = 0;
+    fingerPlaceTime = 0;
+    return;
   }
-  
-  // Only calculate when buffer is filled
-  if (bufferFilled) {
-    // Check for finger detection (higher threshold)
-    uint32_t avgIR = 0;
-    for (int i = 0; i < MAX_SPO2_SAMPLES; i++) {
-      avgIR += irBuffer[i];
-    }
-    avgIR /= MAX_SPO2_SAMPLES;
-    
-    if (avgIR < 50000) {
-      // No finger detected
-      BPM = 0;
-      SpO2 = 0;
-      Serial.println("No finger detected");
-    } else {
-      // Calculate SpO2 and heart rate
-      maxim_heart_rate_and_oxygen_saturation(irBuffer, MAX_SPO2_SAMPLES, redBuffer, &spo2, &validSPO2, &beatsPerMinute, &beatAvg);
-      
-      // Update SpO2 if valid
-      if (validSPO2 == 1 && spo2 > 0 && spo2 <= 100) {
-        SpO2 = spo2;
-        Serial.print("SpO2: "); Serial.println(SpO2);
+
+  // SpO2 buffer (unchanged, working for you)
+  irBuffer[spo2BufferIndex] = irValue;
+  redBuffer[spo2BufferIndex] = redValue;
+  spo2BufferIndex = (spo2BufferIndex + 1) % MAX_SPO2_SAMPLES;
+  if (spo2BufferIndex == 0) spo2BufferFilled = true;
+
+  if (spo2BufferFilled) {
+    bufferLength = MAX_SPO2_SAMPLES;
+    maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &beatsPerMinute, &beatAvg);
+    if (validSPO2 > 0 && spo2 > 70 && spo2 < 101) {
+      SpO2 = spo2;
+      // Apply the requested adjustment
+      if (SpO2 < 90) {
+        SpO2 += spo2Offset;
       }
-      
-      // Update heart rate with averaging
-      if (beatAvg == 1 && beatsPerMinute > 0 && beatsPerMinute < 200) {
+      Serial.print("Valid SpO2: "); Serial.println(SpO2);
+    }
+  }
+
+  // Separate BPM detection (improved: dedicated buffer, noise filter)
+  // Simple DC removal (subtract average from recent samples)
+  uint32_t avgIR = 0;
+  for (int i = 0; i < 4; i++) {  // Rolling average of last 4
+    int idx = (hrBufferIndex - i + MAX_HR_SAMPLES) % MAX_HR_SAMPLES;
+    avgIR += irHRBuffer[idx];
+  }
+  avgIR /= 4;
+  uint32_t dcRemovedIR = irValue > avgIR ? irValue - avgIR : avgIR - irValue;  // Abs diff
+
+  irHRBuffer[hrBufferIndex] = dcRemovedIR;  // Store filtered
+  hrBufferIndex = (hrBufferIndex + 1) % MAX_HR_SAMPLES;
+
+  // Check for beat on filtered signal
+  if (checkForBeat(dcRemovedIR) == true) {
+    long delta = millis() - lastBeat;
+    lastBeat = millis();
+
+    // Filter short deltas (noise)
+    if (delta > 250) {  // Min 240ms (~240 BPM max, but realistic filter)
+      beatsPerMinute = 60 / (delta / 1000.0);
+      if (beatsPerMinute < 255 && beatsPerMinute > 20) {
         rates[rateSpot++] = (byte)beatsPerMinute;
         rateSpot %= RATE_SIZE;
-        
-        // Calculate average
         long total = 0;
-        for (byte i = 0; i < RATE_SIZE; i++) {
-          total += rates[i];
-        }
+        for (byte i = 0; i < RATE_SIZE; i++) total += rates[i]; 
         BPM = total / RATE_SIZE;
-        Serial.print("BPM: "); Serial.println(BPM);
+        beatsDetected = true;
+        Serial.print("Beat detected! Delta: "); Serial.print(delta); Serial.print("ms | Avg BPM: "); Serial.println(BPM);
       }
+    } else {
+      Serial.print("Noise beat filtered (delta: "); Serial.print(delta); Serial.println("ms)");
     }
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(VIBRATION_PIN, OUTPUT);
-  digitalWrite(VIBRATION_PIN, LOW);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  pinMode(VIBRATION_PIN, OUTPUT); digitalWrite(VIBRATION_PIN, LOW);
+  pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
 
-  Wire.begin();
+  Wire.begin();  // SDA=21, SCL=22
   sensors.begin();
 
   // Initialize OLED
@@ -391,207 +344,104 @@ void setup() {
   }
   showSplashScreen();
 
-  // MAX30102 Init with better settings
+  // MAX30102 Init (slower rate for better BPM peaks)
   Serial.println("Initializing MAX30102...");
-  if (particleSensor.begin(Wire, I2C_SPEED_FAST) == false) {
-    Serial.println("MAX30102 was not found. Please check wiring/power.");
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not found. Check wiring!");
     sensorReady = false;
   } else {
-    Serial.println("MAX30102 found");
+    Serial.println("MAX30102 found!");
     sensorReady = true;
     
-    // FIXED: Better sensor configuration
-    particleSensor.setup(); // Use default settings first
+    // Settings for clearer signal (lower rate)
+    byte ledBrightness = 60;
+    byte sampleAverage = 4;
+    byte ledMode = 2;
+    int sampleRate = 100;  // Slower for BPM accuracy
+    int pulseWidth = 411;
+    int adcRange = 4096;
     
-    // Then customize
-    particleSensor.setPulseAmplitudeRed(0x0A);    // Turn Red LED to low to indicate sensor is running
-    particleSensor.setPulseAmplitudeGreen(0);     // Turn off Green LED
-    particleSensor.setPulseAmplitudeIR(0x0A);     // Turn IR LED to low
+    particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+    Serial.println("MAX30102 configured (100Hz). Press finger firmly & stay still!");
     
-    // Initialize arrays
+    // Init buffers
     for (int i = 0; i < MAX_SPO2_SAMPLES; i++) {
-      irBuffer[i] = 0;
-      redBuffer[i] = 0;
+      irBuffer[i] = 0; redBuffer[i] = 0;
     }
-    
-    for (int i = 0; i < RATE_SIZE; i++) {
-      rates[i] = 0;
+    for (int i = 0; i < MAX_HR_SAMPLES; i++) {
+      irHRBuffer[i] = 50000;  // Init to mid-range for DC removal
     }
-    
-    Serial.println("MAX30102 configured successfully");
+    for (int i = 0; i < RATE_SIZE; i++) rates[i] = 72;  // Init to resting avg
   }
 
-  // Button pins
-  for (int i = 0; i < 8; i++) {
-    pinMode(buttonPins[i], INPUT_PULLUP);
-  }
+  // Buttons
+  for (int i = 0; i < 8; i++) pinMode(buttonPins[i], INPUT_PULLUP);
 
-  // Wi-Fi Access Point
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(ssid);
-  Serial.print("AP IP: ");
-  Serial.println(WiFi.softAPIP());
+  // WiFi AP
+  WiFi.mode(WIFI_AP); WiFi.softAP(ssid);
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
 
-  server.on("/", handle_OnConnect);
-  server.onNotFound(handle_NotFound);
-  server.begin();
+  server.on("/", handle_OnConnect); server.onNotFound(handle_NotFound); server.begin();
 
-  // Show MAC
-  uint8_t mac[6];
-  esp_wifi_get_mac(WIFI_IF_AP, mac);
+  // MAC and ESP-NOW (unchanged)
+  uint8_t mac[6]; esp_wifi_get_mac(WIFI_IF_AP, mac);
   Serial.print("Receiver MAC: ");
-  for (int i = 0; i < 6; i++) {
-    if (mac[i] < 16) Serial.print("0");
-    Serial.print(mac[i], HEX);
-    if (i < 5) Serial.print(":");
-  }
+  for (int i = 0; i < 6; i++) { if (mac[i] < 16) Serial.print("0"); Serial.print(mac[i], HEX); if (i < 5) Serial.print(":"); }
   Serial.println();
 
-  // ESP-NOW Setup
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW INIT FAILED");
-    while (true) delay(1000);
-  }
+  if (esp_now_init() != ESP_OK) { Serial.println("ESP-NOW INIT FAILED"); while (true) delay(1000); }
   esp_now_register_recv_cb(onReceive);
   
-  Serial.println("Setup complete. Waiting for finger placement...");
+  Serial.println("Setup complete. Monitor Serial for beats.");
 }
 
 void loop() {
   server.handleClient();
   
-  // FIXED: Use continuous non-blocking sensor reading
-  if (sensorReady) {
-    // Check if data is available
-    if (particleSensor.available()) {
-      // Read new sample
-      uint32_t irValue = particleSensor.getIR();
-      uint32_t redValue = particleSensor.getRed();
-      particleSensor.nextSample();
-      
-      // Store in buffer (using a static variable to track position)
-      static uint16_t bufferIndex = 0;
-      static bool bufferFilled = false;
-      
-      irBuffer[bufferIndex] = irValue;
-      redBuffer[bufferIndex] = redValue;
-      bufferIndex++;
-      
-      // Check if buffer is full
-      if (bufferIndex >= MAX_SPO2_SAMPLES) {
-        bufferIndex = 0;
-        bufferFilled = true;
-      }
-      
-      // Only calculate when buffer is filled
-      if (bufferFilled) {
-        // Check for finger detection
-        if (irValue < 50000) {
-          // No finger detected
-          BPM = 0;
-          SpO2 = 0;
-        } else {
-          // Calculate SpO2 and heart rate
-          maxim_heart_rate_and_oxygen_saturation(irBuffer, MAX_SPO2_SAMPLES, redBuffer, &spo2, &validSPO2, &beatsPerMinute, &beatAvg);
-          
-          // Update SpO2 if valid
-          if (validSPO2 == 1 && spo2 > 0 && spo2 <= 100) {
-            SpO2 = spo2;
-          }
-          
-          // Update heart rate with averaging
-          if (beatAvg == 1 && beatsPerMinute > 0 && beatsPerMinute < 200) {
-            rates[rateSpot++] = (byte)beatsPerMinute;
-            rateSpot %= RATE_SIZE;
-            
-            // Calculate average
-            long total = 0;
-            for (byte i = 0; i < RATE_SIZE; i++) {
-              total += rates[i];
-            }
-            BPM = total / RATE_SIZE;
-          }
-        }
-      }
-    }
-  }
-
-  static bool alertActive = false;
+  readSensorData();
 
   if (millis() - tsLastReport > REPORTING_PERIOD_MS) {
     sensors.requestTemperatures();
     temperatureC = sensors.getTempCByIndex(0);
     
-    // Check for alerts
-    float adjTemp = temperatureC + 1; // +1 adjustment
-    bool bpmOK = (BPM >= 60 && BPM <= 120) || BPM == 0;  // Don't alert if no reading
-    bool spo2OK = (SpO2 >= 95) || SpO2 == 0;             // Don't alert if no reading
+    float adjTemp = temperatureC + tempOffset;
+    bool bpmOK = ((BPM + bpmOffset) >= 60 && (BPM + bpmOffset) <= 120) || BPM == 0;
+    bool spo2OK = (SpO2 >= 95) || SpO2 == 0;
     bool tempOK = adjTemp >= 35 && adjTemp <= 38;
 
     tsLastReport = millis();
-
     alertActive = !((bpmOK || BPM == 0) && (spo2OK || SpO2 == 0) && tempOK);
 
-    // Update the OLED display with new values
+    // Reset beats if no finger for 5s
+    if (!fingerDetected && fingerPlaceTime > 0 && (millis() - fingerPlaceTime > 5000)) {
+      beatsDetected = false;
+    }
+
     updateDisplay();
 
-    // Enhanced but compact Serial Monitor output
+    // Debug Serial every 3s
     static unsigned long lastSerialUpdate = 0;
-    if (millis() - lastSerialUpdate > 3000) { // Every 3 seconds
-      Serial.println("=== HYGEIA ===");
-      
-      Serial.print("BPM: ");
-      if (!bpmOK && BPM > 0) Serial.print("[!] ");
-      Serial.print(sensorReady ? String((int)BPM) : "N/A");
-      
-      Serial.print(" | SpO2: ");
-      if (!spo2OK && SpO2 > 0) Serial.print("[!] ");
-      Serial.print(sensorReady ? String((int)SpO2) + "%" : "N/A");
-      
-      Serial.print(" | Temp: ");
-      if (!tempOK) Serial.print("[!] ");
-      Serial.println(String(adjTemp, 1) + "°C");
-      
-      Serial.print("IR Value: "); Serial.println(particleSensor.getIR());
-      
-      if (alertActive) {
-        Serial.println("*** ALERT: Parameters out of range! ***");
-      }
-      Serial.println("==============");
+    if (millis() - lastSerialUpdate > 3000) {
+      Serial.println("=== HYGEIA DEBUG ===");
+      Serial.print("Finger: "); Serial.print(fingerDetected ? "YES" : "NO");
+      Serial.print(" | Beats: "); Serial.print(beatsDetected ? "YES" : "NO");
+      Serial.print(" | BPM: "); if (!bpmOK && BPM > 0) Serial.print("[!] "); Serial.print(sensorReady ? String((int)(BPM + bpmOffset)) : "N/A");
+      Serial.print(" | SpO2: "); if (!spo2OK && SpO2 > 0) Serial.print("[!] "); Serial.print(sensorReady ? String((int)SpO2) + "%" : "N/A");
+      Serial.print(" | Temp: "); if (!tempOK) Serial.print("[!] "); Serial.println(String(adjTemp, 1) + "°C");
+      if (alertActive) Serial.println("*** ALERT: Parameters out of range! ***");
+      Serial.println("====================");
       lastSerialUpdate = millis();
     }
   }
 
-  // Check button presses
-  for (int i = 0; i < 8; i++) {
-    bool currentState = digitalRead(buttonPins[i]);
-    if (currentState == LOW && lastButtonState[i] == HIGH && (millis() - lastDebounceTime[i] > debounceDelay)) {
-      lastDebounceTime[i] = millis();
-      lastMessage = buttonMessages[i];
-      Serial.print("Button "); Serial.print(i + 1); Serial.print(": ");
-      Serial.println(lastMessage);
+  checkButtons();
 
-      // Start LED blink
-      digitalWrite(LED_PIN, HIGH);
-      ledBlinking = true;
-      ledBlinkStart = millis();
-    }
-    lastButtonState[i] = currentState;
-  }
-
-  // Also trigger LED if alert is active (but don't restart timer if already blinking)
   if (alertActive && !ledBlinking) {
-    digitalWrite(LED_PIN, HIGH);
-    ledBlinking = true;
-    ledBlinkStart = millis();
+    digitalWrite(LED_PIN, HIGH); ledBlinking = true; ledBlinkStart = millis();
   }
-
-  // Turn off LED after duration
   if (ledBlinking && millis() - ledBlinkStart >= ledBlinkDuration) {
-    digitalWrite(LED_PIN, LOW);
-    ledBlinking = false;
+    digitalWrite(LED_PIN, LOW); ledBlinking = false;
   }
 
-  // Small delay to prevent overwhelming the sensor
-  delay(25);
+  delay(10);  // Faster loop for beat detection
 }
