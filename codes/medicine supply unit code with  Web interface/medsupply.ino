@@ -8,7 +8,7 @@
 #define STEP_PIN 19
 #define DIR_PIN 18
 const int ledPin = 21;
-const int msgLedPin = 13; // Microseconds
+const int msgLedPin = 13;
 const int stepsPerRevolution = 20;
 const int microsteps = 10; // Assuming 1/10 microstepping
 const long totalSteps = (stepsPerRevolution * microsteps) / 24; // (200 / 360) * 15 = 8.33, so ~8 steps for 15 degrees. 200/24 is ~8.33
@@ -30,9 +30,15 @@ bool scheduled[24] = {false};
 bool triggered[24] = {false};
 bool expired[24] = {false};
 time_t triggerTimes[24] = {0};
+int originalDelays[24] = {0}; // Store the original delay in minutes for each slot
 bool runLoopNow = false;
 bool isRunning[24] = {false};
 bool manualRunning = false;
+
+// Non-blocking stepper/LED control
+bool stepperSequenceActive = false;
+unsigned long stepperSequenceStart = 0;
+const unsigned long ledOnDuration = 3000;
 
 bool msgLedBlink = false;
 unsigned long msgLedStart = 0;
@@ -43,6 +49,10 @@ bool stopwatchRunning = false;
 unsigned long elapsedTime = 0;
 
 String lastReceivedMessage = ""; //  Store last received ESP-NOW message
+
+// Function Prototypes (Forward Declarations)
+void startStepperSequence(bool isManual, int scheduleIndex = -1);
+void handleStepperSequence();
 
 void setup() {
   Serial.begin(115200);
@@ -107,9 +117,7 @@ void loop() {
 
   if (runLoopNow) {
     runLoopNow = false;
-    manualRunning = true;
-    runStepperLoop();
-    manualRunning = false;
+    startStepperSequence(true);
   }
 
   if (stopwatchRunning) {
@@ -131,6 +139,8 @@ void loop() {
     digitalWrite(msgLedPin, LOW);
     msgLedBlink = false;
   }
+
+  handleStepperSequence();
 }
 
 void checkAndRunSchedule() {
@@ -140,10 +150,8 @@ void checkAndRunSchedule() {
   for (int i = 0; i < 24; i++) {
     if (scheduled[i] && !triggered[i]) {
       if (now >= triggerTimes[i]) {
-        isRunning[i] = true;
-        runStepperLoop();
+        startStepperSequence(false, i);
         triggered[i] = true;
-        isRunning[i] = false;
       } else if (now > triggerTimes[i] + 60) {
         expired[i] = true;
         scheduled[i] = false;
@@ -162,6 +170,7 @@ void handleSetSchedule() {
       triggered[i] = false;
       expired[i] = false;
       triggerTimes[i] = 0;
+      originalDelays[i] = 0; // Reset original delays
     }
 
     time_t now;
@@ -178,6 +187,7 @@ void handleSetSchedule() {
         if (index >= 0 && index < 24 && delayMin > 0) {
           scheduled[index] = true;
           triggerTimes[index] = now + (delayMin * 60);
+          originalDelays[index] = delayMin; // Store the original delay
           anyScheduled = true;
         }
       }
@@ -330,85 +340,64 @@ void handleRoot() {
     <div class="stopwatch" id="stopwatchDisplay">Stopwatch: 00:00:00.000</div>
 
     <div class="card">
-  <h2>Last Message Received</h2>
-  <div id="msgDisplay" style="font-size: 18px; color: #333; background: #eef; padding: 10px; border-radius: 8px;">None</div>
-</div>
-
-
-    <div class="card">
       <h2>Manual Trigger</h2>
       <button class="manual" id="manualTriggerBtn" onclick="triggerLoop()">Run Stepper Motor and Vibrating Loop</button>
     </div>
 
     <div class="card">
       <h2>Set Time (hours and minutes)</h2>
-      <form id="scheduleForm">
-      <div class='input-columns'>
-        <div class='left-column'>
+      <form id="scheduleForm" onsubmit="return false;">
+      <div id="time-slots-container">
+        <!-- Time slots will be dynamically inserted here -->
+      </div>
+      <button class="set-btn" onclick="addSlot()">+ Add Time Slot</button>
   )rawliteral";
 
   time_t now;
   time(&now);
 
-  for (int i = 0; i < 12; i++) {
-    html += "<div class='time-row'><div><label>Input " + String(i + 1) + ":</label>";
-
-    if (scheduled[i] && triggerTimes[i] > now) {
-      long remaining = triggerTimes[i] - now;
-      int hours = remaining / 3600;
-      int minutes = (remaining % 3600) / 60;
-      html += "<input type='number' id='hour" + String(i) + "' value='" + String(hours) + "' min='0' /> ";
-      html += "<input type='number' id='min" + String(i) + "' value='" + String(minutes) + "' min='0' />";
-    } else {
-      html += "<input type='number' id='hour" + String(i) + "' placeholder='hr' min='0' /> ";
-      html += "<input type='number' id='min" + String(i) + "' placeholder='min' min='0' />";
-    }
-
-    html += "</div><span class='status' id='status" + String(i) + "'></span></div>";
-  }
-
-  html += "</div><div class='right-column'>";
-
-  for (int i = 12; i < 24; i++) {
-    html += "<div class='time-row'><div><label>Input " + String(i + 1) + ":</label>";
-
-    if (scheduled[i] && triggerTimes[i] > now) {
-      long remaining = triggerTimes[i] - now;
-      int hours = remaining / 3600;
-      int minutes = (remaining % 3600) / 60;
-      html += "<input type='number' id='hour" + String(i) + "' value='" + String(hours) + "' min='0' /> ";
-      html += "<input type='number' id='min" + String(i) + "' value='" + String(minutes) + "' min='0' />";
-    } else {
-      html += "<input type='number' id='hour" + String(i) + "' placeholder='hr' min='0' /> ";
-      html += "<input type='number' id='min" + String(i) + "' placeholder='min' min='0' />";
-    }
-
-    html += "</div><span class='status' id='status" + String(i) + "'></span></div>";
-  }
-
   html += R"rawliteral(
-        </div>
-      </div>
       </form>
       <button class='set-btn' id="setBtn" onclick='setSchedule()'>Set Schedule</button>
       <form action="/reset" method="get">
         <button class='reset-btn' type="submit">Reset All</button>
       </form>
     </div>
-
     <script>
+      let slotCounter = 0;
+      const MAX_SLOTS = 24;
+
       function setSchedule() {
         let params = [];
-        for (let i = 0; i < 24; i++) {
-          const h = document.getElementById('hour' + i).value;
-          const m = document.getElementById('min' + i).value;
-          if (h !== '' || m !== '') {
-            const totalMin = (parseInt(h || '0') * 60) + parseInt(m || '0');
-            if (totalMin > 0) {
-              params.push(i + '-' + totalMin);
+        const slots = document.querySelectorAll('.time-row');
+        
+        // Create a map to hold index and total minutes
+        const scheduleMap = new Map();
+
+        slots.forEach(slot => {
+          const indexInput = slot.querySelector('input[type=hidden]');
+          const hInput = slot.querySelector('.hour-input');
+          const mInput = slot.querySelector('.min-input');
+          
+          if (indexInput && hInput && mInput) {
+            const index = parseInt(indexInput.value);
+            const h = hInput.value;
+            const m = mInput.value;
+            
+            if (h !== '' || m !== '') {
+              const totalMin = (parseInt(h || '0') * 60) + parseInt(m || '0');
+              if (totalMin > 0) {
+                scheduleMap.set(index, totalMin);
+              }
             }
           }
+        });
+
+        // Convert map to params array, ensuring unique indices
+        for(let [index, totalMin] of scheduleMap.entries()){
+            params.push(index + '-' + totalMin);
         }
+
         if (params.length > 0) {
           window.location.href = '/setSchedule?b=' + params.join(',');
         }
@@ -450,15 +439,13 @@ void handleRoot() {
       }
 
       function updateLastMessage() {
-  fetch('/getLastMsg')
-    .then(response => response.text())
-    .then(msg => {
-      document.getElementById('msgDisplay').innerText = msg || "None";
-    });
-}
+        fetch('/getLastMsg')
+          .then(response => response.text())
+          .then(msg => {
+            document.getElementById('msgDisplay').innerText = msg || "None";
+          });
+      }
 
-setInterval(updateLastMessage, 1000);
-updateLastMessage();
 
 
       const scheduled = [)rawliteral";
@@ -482,32 +469,109 @@ updateLastMessage();
     if (i > 0) html += ",";
     html += isRunning[i] ? "true" : "false";
   }
+  html += "]\nconst triggerTimes = [";
+  for (int i = 0; i < 24; i++) {
+    if (i > 0) html += ",";
+    html += String(triggerTimes[i]);
+  }
+  html += "]\nconst originalDelays = [";
+  for (int i = 0; i < 24; i++) {
+    if (i > 0) html += ",";
+    html += String(originalDelays[i]);
+  }
   html += "]\n";
 
   html += R"rawliteral(
-      function applyStatusColors() {
-        for (let i = 0; i < 24; i++) {
-          const el = document.getElementById('status' + i);
-          if (running[i]) {
-            el.innerText = 'Running';
-            el.className = 'status running';
-          } else if (triggered[i]) {
-            el.innerText = 'Done';
-            el.className = 'status done';
-          } else if (scheduled[i]) {
-            el.innerText = 'Scheduled';
-            el.className = 'status scheduled';
-          } else if (expired[i]) {
-            el.innerText = 'Expired';
-            el.className = 'status expired';
-          } else {
-            el.innerText = '';
-            el.className = 'status';
+      const container = document.getElementById('time-slots-container');
+
+      function createSlot(index, hours = '', minutes = '') {
+        if (slotCounter >= MAX_SLOTS) return;
+        
+        const div = document.createElement('div');
+        div.className = 'time-row';
+        div.innerHTML = `
+          <div>
+            <label>Input ${slotCounter + 1}:</label>
+            <input type="hidden" value="${index}">
+            <input type="number" class="hour-input" placeholder="hr" min="0" value="${hours}" />
+            <input type="number" class="min-input" placeholder="min" min="0" value="${minutes}" />
+          </div>
+          <span class="status" id="status${index}"></span>
+        `;
+        container.appendChild(div);
+        slotCounter++;
+        updateStatus(index);
+      }
+
+      function addSlot() {
+        if (slotCounter >= MAX_SLOTS) {
+          alert("Maximum of 24 time slots reached.");
+          return;
+        }
+        // Find the next available index that is not already scheduled
+        let nextIndex = 0;
+        while(nextIndex < MAX_SLOTS) {
+            const isUsed = Array.from(container.querySelectorAll('input[type=hidden]')).some(input => parseInt(input.value) === nextIndex);
+            if (!isUsed) break;
+            nextIndex++;
+        }
+        if(nextIndex < MAX_SLOTS) {
+            createSlot(nextIndex);
+        }
+      }
+
+      function updateStatus(index) {
+        const el = document.getElementById('status' + index);
+        if (!el) return;
+
+        if (running[index]) {
+          el.innerText = 'Running';
+          el.className = 'status running';
+        } else if (triggered[index]) {
+          el.innerText = 'Done';
+          el.className = 'status done';
+        } else if (scheduled[index]) {
+          el.innerText = 'Scheduled';
+          el.className = 'status scheduled';
+        } else if (expired[index]) {
+          el.innerText = 'Expired';
+          el.className = 'status expired';
+        } else {
+          el.innerText = '';
+          el.className = 'status';
+        }
+      }
+
+      function updateRemainingTimes() {
+        const now = Math.floor(Date.now() / 1000);
+        for (let i = 0; i < triggerTimes.length; i++) {
+          if (scheduled[i] && triggerTimes[i] > now) {
+            const remaining = triggerTimes[i] - now;
+            const hours = Math.floor(remaining / 3600);
+            const minutes = Math.floor((remaining % 3600) / 60);
+            const seconds = remaining % 60;
+
+            const statusEl = document.getElementById(`status${i}`);
+            if (statusEl) {
+              statusEl.setAttribute("title", `${hours}h ${minutes}m ${seconds}s remaining`);
+            }
           }
         }
       }
 
-      applyStatusColors();
+      document.addEventListener('DOMContentLoaded', () => {
+        const now = Math.floor(Date.now() / 1000);
+        for (let i = 0; i < triggerTimes.length; i++) {
+          if (scheduled[i] && originalDelays[i] > 0) {
+            const hours = Math.floor(originalDelays[i] / 60);
+            const minutes = originalDelays[i] % 60;
+            createSlot(i, hours, minutes);
+          }
+        }
+      });
+
+      setInterval(updateLastMessage, 1000);
+      setInterval(updateRemainingTimes, 1000);
       setInterval(updateStopwatch, 100);
       setInterval(() => location.reload(), 30000);
     </script>
@@ -537,23 +601,48 @@ void handleReset() {
   server.send(302, "text/plain", "");
 }
 
-void runStepperLoop() {
+void startStepperSequence(bool isManual, int scheduleIndex) {
+  if (stepperSequenceActive) return; // Prevent re-triggering if already running
+
+  stepperSequenceActive = true;
+  stepperSequenceStart = millis();
+  manualRunning = isManual;
+  if (scheduleIndex != -1) {
+    isRunning[scheduleIndex] = true;
+  }
+
   uint8_t msg[] = {1};
   esp_err_t result = esp_now_send(receiverMAC, msg, sizeof(msg));
   if (result == ESP_OK) {
     Serial.println("Vibration signal sent via ESP-NOW.");
   } else {
     Serial.println("Failed to send vibration signal.");
-  }
-
+  }  
+  
   for (long i = 0; i < totalSteps; i++) {
     digitalWrite(STEP_PIN, HIGH);
     delayMicroseconds(delayPerStep);
     digitalWrite(STEP_PIN, LOW);
     delayMicroseconds(delayPerStep);
   }
-
+  
   digitalWrite(ledPin, HIGH);
-  delay(3000);
-  digitalWrite(ledPin, LOW);
+}
+
+void handleStepperSequence() {
+  if (!stepperSequenceActive) return;
+
+  if (millis() - stepperSequenceStart >= ledOnDuration) {
+    digitalWrite(ledPin, LOW);
+    stepperSequenceActive = false;
+    manualRunning = false;
+
+    // Reset isRunning flags
+    for(int i=0; i<24; i++){
+      if(isRunning[i]){
+        isRunning[i] = false;
+      }
+    }
+    Serial.println("Stepper sequence finished.");
+  }
 }
