@@ -11,6 +11,8 @@
 // ===========================
 const char *ssid = "SLT_FIBER_j34yd";
 const char *password = "dmpi1027";
+const char *ssid = "YOUR_WIFI_SSID";
+const char *password = "YOUR_WIFI_PASSWORD";
 
 void startCameraServer();
 void setupLedFlash();
