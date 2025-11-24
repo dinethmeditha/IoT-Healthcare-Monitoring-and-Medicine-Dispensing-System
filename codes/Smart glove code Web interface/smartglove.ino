@@ -45,6 +45,11 @@ int8_t validSPO2;
 uint32_t irHRBuffer[MAX_HR_SAMPLES];
 uint16_t hrBufferIndex = 0;
 
+// SpO2 averaging
+const byte SPO2_AVG_SIZE = 4; // Average over last 4 valid readings
+float spo2History[SPO2_AVG_SIZE];
+byte spo2HistoryIndex = 0;
+
 float BPM = 0, SpO2 = 0, temperatureC = 0.0;
 uint32_t tsLastReport = 0;
 bool sensorReady = false;
@@ -53,7 +58,7 @@ bool alertActive = false;
 // Sensor value offsets
 const float tempOffset = 1.0;
 const int bpmOffset = 20;
-const int spo2Offset = 20;
+const int spo2Offset = 10;
 
 // Normal health range thresholds
 const float TEMP_NORMAL_LOW = 35.0;
@@ -296,12 +301,23 @@ void readSensorData() {
     bufferLength = MAX_SPO2_SAMPLES;
     maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &beatsPerMinute, &beatAvg);
     if (validSPO2 > 0 && spo2 > 70 && spo2 < 101) {
-      SpO2 = spo2;
-      // Apply the requested adjustment
-      if (SpO2 < 90) {
-        SpO2 += spo2Offset;
+      float currentSpo2 = spo2;
+      
+      // Apply the offset adjustment for any reading below the normal threshold
+      if (currentSpo2 < SPO2_NORMAL_LOW) { // SPO2_NORMAL_LOW is 95
+        currentSpo2 += spo2Offset;
       }
-      Serial.print("Valid SpO2: "); Serial.println(SpO2);
+
+      // Cap the value at 100% to prevent unrealistic readings
+      if (currentSpo2 > 100) {
+        currentSpo2 = 100;
+      }
+
+      // Add to history for averaging
+      spo2History[spo2HistoryIndex] = currentSpo2;
+      spo2HistoryIndex = (spo2HistoryIndex + 1) % SPO2_AVG_SIZE;
+
+      Serial.print("Valid Raw SpO2: "); Serial.println(currentSpo2);
     }
   }
 
@@ -339,6 +355,14 @@ void readSensorData() {
       Serial.print("Noise beat filtered (delta: "); Serial.print(delta); Serial.println("ms)");
     }
   }
+
+  // Calculate average SpO2 from history
+  float totalSpo2 = 0;
+  int validSamples = 0;
+  for (byte i = 0; i < SPO2_AVG_SIZE; i++) {
+    if (spo2History[i] > 0) { totalSpo2 += spo2History[i]; validSamples++; }
+  }
+  if (validSamples > 0) SpO2 = totalSpo2 / validSamples;
 }
 
 void setup() {
@@ -384,6 +408,7 @@ void setup() {
       irHRBuffer[i] = 50000;  // Init to mid-range for DC removal
     }
     for (int i = 0; i < RATE_SIZE; i++) rates[i] = 72;  // Init to resting avg
+    for (int i = 0; i < SPO2_AVG_SIZE; i++) spo2History[i] = 0; // Init SpO2 history
   }
 
   // Buttons
