@@ -53,7 +53,14 @@ bool alertActive = false;
 // Sensor value offsets
 const float tempOffset = 1.0;
 const int bpmOffset = 20;
-const int spo2Offset = 10;
+const int spo2Offset = 20;
+
+// Normal health range thresholds
+const float TEMP_NORMAL_LOW = 35.0;
+const float TEMP_NORMAL_HIGH = 38.0;
+const int BPM_NORMAL_LOW = 60;
+const int BPM_NORMAL_HIGH = 120;
+const int SPO2_NORMAL_LOW = 95;
 
 // Sample management
 uint16_t spo2BufferIndex = 0;
@@ -96,8 +103,14 @@ unsigned long lastDebounceTime[8] = {0};
 const unsigned long debounceDelay = 300;
 String lastMessage = "No message yet";
 const char* buttonMessages[8] = {
-  "Medicine A Dispensed", "Medicine B Dispensed", "Vitals Checked", "Water Reminder",
-  "Doctor Alert Sent", "Time to Rest", "Nurse Assistance Needed", "Emergency Alert Triggered"
+  "Message 1", 
+  "Message 2", 
+  "Message 3",
+  "Message 4",
+  "Message 5", 
+  "Message 6",
+  "Message 7", 
+  "Message 8"
 };
 
 // ESP-NOW callback (unchanged)
@@ -113,9 +126,9 @@ void onReceive(const esp_now_recv_info_t *info, const uint8_t *incomingData, int
 // HTML Page (updated with beats status)
 String SendHTML(float BPM, float SpO2, float temperatureC_raw, String lastMessage, bool fingerDetected, bool beatsDetected) {
   float temperatureC = temperatureC_raw + tempOffset;
-  bool bpmOK = (BPM + bpmOffset) >= 60 && (BPM + bpmOffset) <= 120;
-  bool spo2OK = SpO2 >= 95;
-  bool tempOK = temperatureC >= 35 && temperatureC <= 38;
+  bool bpmOK = (BPM + bpmOffset) >= BPM_NORMAL_LOW && (BPM + bpmOffset) <= BPM_NORMAL_HIGH;
+  bool spo2OK = SpO2 >= SPO2_NORMAL_LOW;
+  bool tempOK = temperatureC >= TEMP_NORMAL_LOW && temperatureC <= TEMP_NORMAL_HIGH;
 
   String outOfRange = "";
   if (!bpmOK && BPM > 0) outOfRange += "Heart Rate, ";
@@ -165,12 +178,11 @@ void updateDisplay() {
   display.setCursor(120, 0);
   display.print(WiFi.softAPgetStationNum() > 0 ? "*" : "o");
   
-  display.drawFastHLine(0, 9, SCREEN_WIDTH, SH110X_WHITE);
-  
-  bool bpmOK = ((BPM + bpmOffset) >= 60 && (BPM + bpmOffset) <= 120) || BPM == 0;
-  bool spo2OK = (SpO2 >= 95) || SpO2 == 0;
+  display.drawFastHLine(0, 9, SCREEN_WIDTH, SH110X_WHITE);  
+  bool bpmOK = ((BPM + bpmOffset) >= BPM_NORMAL_LOW && (BPM + bpmOffset) <= BPM_NORMAL_HIGH) || BPM == 0;
+  bool spo2OK = (SpO2 >= SPO2_NORMAL_LOW) || SpO2 == 0;
   float adjTemp = temperatureC + tempOffset;
-  bool tempOK = adjTemp >= 35 && adjTemp <= 38;
+  bool tempOK = adjTemp >= TEMP_NORMAL_LOW && adjTemp <= TEMP_NORMAL_HIGH;
   
   // Vitals row
   display.setCursor(0, 12); display.drawBitmap(0, 12, pulse_icon, 6, 6, SH110X_WHITE);
@@ -405,9 +417,9 @@ void loop() {
     temperatureC = sensors.getTempCByIndex(0);
     
     float adjTemp = temperatureC + tempOffset;
-    bool bpmOK = ((BPM + bpmOffset) >= 60 && (BPM + bpmOffset) <= 120) || BPM == 0;
-    bool spo2OK = (SpO2 >= 95) || SpO2 == 0;
-    bool tempOK = adjTemp >= 35 && adjTemp <= 38;
+    bool bpmOK = ((BPM + bpmOffset) >= BPM_NORMAL_LOW && (BPM + bpmOffset) <= BPM_NORMAL_HIGH) || BPM == 0;
+    bool spo2OK = (SpO2 >= SPO2_NORMAL_LOW) || SpO2 == 0;
+    bool tempOK = adjTemp >= TEMP_NORMAL_LOW && adjTemp <= TEMP_NORMAL_HIGH;
 
     tsLastReport = millis();
     alertActive = !((bpmOK || BPM == 0) && (spo2OK || SpO2 == 0) && tempOK);
