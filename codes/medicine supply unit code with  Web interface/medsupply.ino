@@ -11,7 +11,7 @@ const int ledPin = 21;
 const int msgLedPin = 13;
 const int stepsPerRevolution = 20;
 const int microsteps = 10; // Assuming 1/10 microstepping
-const long totalSteps = (stepsPerRevolution * microsteps) / 24; // (200 / 360) * 15 = 8.33, so ~8 steps for 15 degrees. 200/24 is ~8.33
+const long totalSteps = (stepsPerRevolution * microsteps) / 12; // Each slot is 30 degrees (360/12). (200 steps / 360 deg) * 30 deg = ~16.67 steps.
 const long delayPerStep = 2500;
 
 WebServer server(80);
@@ -26,13 +26,13 @@ const int daylightOffset_sec = 0;
 uint8_t receiverMAC[] = {0xEC, 0xE3, 0x34, 0x7A, 0x81, 0xD5};
 uint8_t senderMAC[6];
 
-bool scheduled[24] = {false};
-bool triggered[24] = {false};
-bool expired[24] = {false};
-time_t triggerTimes[24] = {0};
-int originalDelays[24] = {0}; // Store the original delay in minutes for each slot
+bool scheduled[12] = {false};
+bool triggered[12] = {false};
+bool expired[12] = {false};
+time_t triggerTimes[12] = {0};
+int originalDelays[12] = {0}; // Store the original delay in minutes for each slot
 bool runLoopNow = false;
-bool isRunning[24] = {false};
+bool isRunning[12] = {false};
 bool manualRunning = false;
 
 // Non-blocking stepper/LED control
@@ -122,7 +122,7 @@ void loop() {
 
   if (stopwatchRunning) {
     bool allCompleted = true;
-    for (int i = 0; i < 24; i++) {
+    for (int i = 0; i < 12; i++) {
       if (scheduled[i] && !triggered[i]) {
         allCompleted = false;
         break;
@@ -147,7 +147,7 @@ void checkAndRunSchedule() {
   time_t now;
   time(&now);
 
-  for (int i = 0; i < 24; i++) {
+  for (int i = 0; i < 12; i++) {
     if (scheduled[i] && !triggered[i]) {
       if (now >= triggerTimes[i]) {
         startStepperSequence(false, i);
@@ -165,7 +165,7 @@ void handleSetSchedule() {
     String param = server.arg("b");
     param.trim();
 
-    for (int i = 0; i < 24; i++) {
+    for (int i = 0; i < 12; i++) {
       scheduled[i] = false;
       triggered[i] = false;
       expired[i] = false;
@@ -184,7 +184,7 @@ void handleSetSchedule() {
       if (dash > 0) {
         int index = pair.substring(0, dash).toInt();
         int delayMin = pair.substring(dash + 1).toInt();
-        if (index >= 0 && index < 24 && delayMin > 0) {
+        if (index >= 0 && index < 12 && delayMin > 0) {
           scheduled[index] = true;
           triggerTimes[index] = now + (delayMin * 60);
           originalDelays[index] = delayMin; // Store the original delay
@@ -365,7 +365,7 @@ void handleRoot() {
     </div>
     <script>
       let slotCounter = 0;
-      const MAX_SLOTS = 24;
+      const MAX_SLOTS = 12;
 
       function setSchedule() {
         let params = [];
@@ -450,32 +450,32 @@ void handleRoot() {
 
       const scheduled = [)rawliteral";
 
-  for (int i = 0; i < 24; i++) {
+  for (int i = 0; i < 12; i++) {
     if (i > 0) html += ",";
     html += scheduled[i] ? "true" : "false";
   }
   html += "]\nconst triggered = [";
-  for (int i = 0; i < 24; i++) {
+  for (int i = 0; i < 12; i++) {
     if (i > 0) html += ",";
     html += triggered[i] ? "true" : "false";
   }
   html += "]\nconst expired = [";
-  for (int i = 0; i < 24; i++) {
+  for (int i = 0; i < 12; i++) {
     if (i > 0) html += ",";
     html += expired[i] ? "true" : "false";
   }
   html += "]\nconst running = [";
-  for (int i = 0; i < 24; i++) {
+  for (int i = 0; i < 12; i++) {
     if (i > 0) html += ",";
     html += isRunning[i] ? "true" : "false";
   }
   html += "]\nconst triggerTimes = [";
-  for (int i = 0; i < 24; i++) {
+  for (int i = 0; i < 12; i++) {
     if (i > 0) html += ",";
     html += String(triggerTimes[i]);
   }
   html += "]\nconst originalDelays = [";
-  for (int i = 0; i < 24; i++) {
+  for (int i = 0; i < 12; i++) {
     if (i > 0) html += ",";
     html += String(originalDelays[i]);
   }
@@ -505,7 +505,7 @@ void handleRoot() {
 
       function addSlot() {
         if (slotCounter >= MAX_SLOTS) {
-          alert("Maximum of 24 time slots reached.");
+          alert("Maximum of 12 time slots reached.");
           return;
         }
         // Find the next available index that is not already scheduled
@@ -587,11 +587,11 @@ void handleManualTrigger() {
 }
 
 void handleReset() {
-  for (int i = 0; i < 24; i++) {
+  for (int i = 0; i < 12; i++) {
     scheduled[i] = false;
     triggered[i] = false;
     expired[i] = false;
-    isRunning[i] = false;
+    isRunning[i] = false; 
     triggerTimes[i] = 0;
   }
   stopwatchRunning = false;
@@ -638,7 +638,7 @@ void handleStepperSequence() {
     manualRunning = false;
 
     // Reset isRunning flags
-    for(int i=0; i<24; i++){
+    for(int i=0; i<12; i++){
       if(isRunning[i]){
         isRunning[i] = false;
       }
