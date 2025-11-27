@@ -56,8 +56,8 @@ bool sensorReady = false;
 bool alertActive = false;
 
 // Sensor value offsets
-const float tempOffset = 1.0;
-const int bpmOffset = 20;
+const float tempOffset = 2.0;
+const int bpmOffset = 40;
 const int spo2Offset = 10;
 
 // Normal health range thresholds
